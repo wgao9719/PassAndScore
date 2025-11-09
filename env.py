@@ -87,9 +87,10 @@ class PassAndScoreEnv:
         ball_radius: float = 0.03,
         max_speed_agent: float = 1.2,
         max_speed_ball: float = 2.0,
-        accel: float = 2.0,
+        accel: float = 1.0,
         friction_agent: float = 0.95,
         friction_ball: float = 0.995,
+        restitution: float = 0.5,
         sample_interior_ratio: float = 0.8,
     ):
         self.centralized = centralized
@@ -107,6 +108,7 @@ class PassAndScoreEnv:
         self.accel = accel
         self.friction_agent = friction_agent
         self.friction_ball = friction_ball
+        self.restitution = restitution
 
         self.np_random: np.random.Generator = np.random.default_rng(seed)
         self.sample_interior_ratio = sample_interior_ratio
@@ -145,8 +147,12 @@ class PassAndScoreEnv:
         pball = self.region_a.sample_point(self.np_random, interior_ratio=self.sample_interior_ratio)
         vball = np.zeros(2, dtype=np.float32)
 
-        self.state = dict(pA=pA, pB=pB, vA=vA, vB=vB,
-                          pball=pball, vball=vball, steps=0)
+        # NEW/CHANGED: track last player to touch the ball; default "A" (so shaping can default to pass-to-B)
+        self.state = dict(
+            pA=pA, pB=pB, vA=vA, vB=vB,
+            pball=pball, vball=vball, steps=0,
+            last_touch="A"  # default as requested
+        )
 
         obs = self._get_obs()
         info = {}
@@ -184,28 +190,27 @@ class PassAndScoreEnv:
         s["pB"] = s["pB"] + s["vB"] * self.dt
         s["pball"] = s["pball"] + s["vball"] * self.dt
 
-        def try_contact(p_agent, v_agent):
+        # NEW/CHANGED: track last toucher when contact occurs
+        def try_contact(p_agent, v_agent, who_label: str):
             d = s["pball"] - p_agent
             dist = float(np.linalg.norm(d))
             if dist < (self.agent_radius + self.ball_radius):
-                # direction to kick: agent motion direction if moving, otherwise towards ball (or up)
                 vel_norm = np.linalg.norm(v_agent)
                 if vel_norm > 1e-6:
                     dir_imp = v_agent / (vel_norm + 1e-12)
                 else:
-                    # prefer pushing away from agent center towards ball
                     if dist > 1e-6:
                         dir_imp = d / (dist + 1e-12)
                     else:
                         dir_imp = np.array([0.0, 1.0], dtype=np.float32)
-                # smaller impulse
                 impulse = 0.8 * dir_imp
                 s["vball"] += impulse
                 n = d / (dist + 1e-6) if dist > 0.0 else dir_imp
                 s["pball"] = p_agent + n * (self.agent_radius + self.ball_radius + 1e-3)
+                s["last_touch"] = who_label  # record last player to touch
 
-        try_contact(s["pA"], s["vA"])
-        try_contact(s["pB"], s["vB"])
+        try_contact(s["pA"], s["vA"], "A")
+        try_contact(s["pB"], s["vB"], "B")
 
         s["vA"] *= self.friction_agent
         s["vB"] *= self.friction_agent
@@ -216,46 +221,72 @@ class PassAndScoreEnv:
         xmax = self.region_b.xmax + self.field_padding
         ymin = min(self.region_a.ymin, self.region_b.ymin) - self.field_padding
         ymax = max(self.region_a.ymax, self.region_b.ymax) + self.field_padding
-        restitution = 0.8  # energy retained on bounce
 
         # X bounds
         if s["pball"][0] - self.ball_radius < xmin:
             s["pball"][0] = xmin + self.ball_radius
-            s["vball"][0] = -s["vball"][0] * restitution
+            s["vball"][0] = -s["vball"][0] * self.restitution
         elif s["pball"][0] + self.ball_radius > xmax:
             s["pball"][0] = xmax - self.ball_radius
-            s["vball"][0] = -s["vball"][0] * restitution
+            s["vball"][0] = -s["vball"][0] * self.restitution
 
         # Y bounds
         if s["pball"][1] - self.ball_radius < ymin:
             s["pball"][1] = ymin + self.ball_radius
-            s["vball"][1] = -s["vball"][1] * restitution
+            s["vball"][1] = -s["vball"][1] * self.restitution
         elif s["pball"][1] + self.ball_radius > ymax:
-            s["pball"][1] = ymax - self.ball_radius
-            s["vball"][1] = -s["vball"][1] * restitution
+            # NEW/CHANGED: goal mouth is an opening; don't bounce there
+            in_mouth = (self.goal_xmin <= s["pball"][0] <= self.goal_xmax)
+            if not in_mouth:
+                s["pball"][1] = ymax - self.ball_radius
+                s["vball"][1] = -s["vball"][1] * self.restitution
+            # else: allow pass-through (no clamp, no reflection)
 
         # enforce max speed for ball after impulses and bounces
         s["vball"] = cap(s["vball"], self.max_speed_ball)
 
+        # Termination & reward
         terminated = False
         reward = 0.01
         if not self.region_a.contains_point(s["pA"]) or not self.region_b.contains_point(s["pB"]):
             reward = -10.0
             terminated = True
 
-        crossed_goal_line = (s["pball"][1] >= self.region_b.ymax and
-                             self.goal_xmin <= s["pball"][0] <= self.goal_xmax and
-                             self.region_b.xmin <= s["pball"][0] <= self.region_b.xmax)
-        if crossed_goal_line:
+        # Detect crossing the goal line inside the posts
+        crossed_goal_line = (
+            s["pball"][1] >= self.region_b.ymax and
+            self.goal_xmin <= s["pball"][0] <= self.goal_xmax and
+            self.region_b.xmin <= s["pball"][0] <= self.region_b.xmax
+        )
+        # NEW/CHANGED: only count as a goal if last touch was by B
+        if crossed_goal_line and (s.get("last_touch") == "B"):
             reward = 10.0
             terminated = True
+        # else: ball "goes through" the mouth with no bounce and no reward
 
         s["steps"] += 1
         truncated = (s["steps"] >= self.max_steps) and not terminated
 
         obs = self._get_obs()
-        info["after"] = self._get_info()
+        # NEW/CHANGED: include extra flags and last_touch in info["after"]
+        info_after = self._get_info()
+        info_after["crossed_goal_mouth"] = bool(crossed_goal_line)
+        info_after["scored_goal"] = bool(crossed_goal_line and (s.get("last_touch") == "B"))
+        info["after"] = info_after
         return obs, reward, terminated, truncated, info
+
+    def _dist_to_goal_mouth(self, bx: float, by: float) -> float:
+        # vertical gap (only if below the line)
+        dy = max(0.0, self.goal_y - float(by))
+
+        # horizontal gap to the segment (0 if within posts)
+        if self.goal_xmin <= float(bx) <= self.goal_xmax:
+            dx = 0.0
+        else:
+            dx = min(abs(float(bx) - self.goal_xmin), abs(float(bx) - self.goal_xmax))
+
+        # Euclidean distance in the forward half-space
+        return float(math.hypot(dx, dy))
 
     def _relative(self, ref_p: np.ndarray, ref_v: np.ndarray, obj_p: np.ndarray, obj_v: np.ndarray):
         # no orientation; relative = simple difference in world frame
@@ -286,15 +317,18 @@ class PassAndScoreEnv:
     
     def _get_info(self):
         s = self.state
-        return {
+        dist_B_to_ball = float(np.linalg.norm(s["pB"] - s["pball"]))
+        info = {
             "ball_x": float(s["pball"][0]),
             "ball_y": float(s["pball"][1]),
-            "dist_ball_to_goal": float(max(0.0, self.goal_y - s["pball"][1])),
+            "dist_ball_to_goal": self._dist_to_goal_mouth(s["pball"][0], s["pball"][1]),
             "dist_A_to_ball": float(np.linalg.norm(s["pA"] - s["pball"])),
-            "dist_B_to_ball": float(np.linalg.norm(s["pB"] - s["pball"])),
+            "dist_B_to_ball": dist_B_to_ball,
             "passed_regions": bool(self.region_b.contains_point(s["pball"])),  # ball in B?
             "speed_ball": float(np.linalg.norm(s["vball"])),
+            "last_touch": s.get("last_touch", "A"),
         }
+        return info
 
     def render(self):
         s = self.state
@@ -350,14 +384,15 @@ class PassAndScoreEnv:
         # Build a compact, human-readable representation of the state
         def fmt_item(x):
             try:
-                # numpy arrays / iterables
                 it = list(x)
                 return "[" + ", ".join(f"{float(v):.2f}" for v in it) + "]"
             except Exception:
                 return f"{float(x):.2f}"
 
+        # NEW/CHANGED: include last_touch in the HUD text
         text_lines = [
             f"steps: {int(s.get('steps', 0))}",
+            f"last_touch: {s.get('last_touch', 'A')}",
             f"pA: {fmt_item(s['pA'])}",
             f"vA: {fmt_item(s['vA'])}",
             f"pB: {fmt_item(s['pB'])}",
@@ -367,7 +402,6 @@ class PassAndScoreEnv:
         ]
         state_text = "\n".join(text_lines)
 
-        # Draw the text box in the top-right corner of the axes
         ax.text(0.98, 0.98, state_text, transform=ax.transAxes,
             fontsize=8, ha="right", va="top",
             bbox=dict(facecolor="white", alpha=0.85, edgecolor="black"))
