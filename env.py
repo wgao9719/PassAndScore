@@ -144,7 +144,7 @@ class PassAndScoreEnv:
         pB = self.region_b.sample_point(self.np_random, interior_ratio=self.sample_interior_ratio)
         vA = np.zeros(2, dtype=np.float32)
         vB = np.zeros(2, dtype=np.float32)
-        pball = self.region_a.sample_point(self.np_random, interior_ratio=self.sample_interior_ratio)
+        pball = self.region_b.sample_point(self.np_random, interior_ratio=self.sample_interior_ratio)
         vball = np.zeros(2, dtype=np.float32)
 
         # NEW/CHANGED: track last player to touch the ball; default "A" (so shaping can default to pass-to-B)
@@ -248,9 +248,12 @@ class PassAndScoreEnv:
         # Termination & reward
         terminated = False
         reward = 0.01
+        left_regions = False
+
         if not self.region_a.contains_point(s["pA"]) or not self.region_b.contains_point(s["pB"]):
             reward = -10.0
             terminated = True
+            left_regions = True
 
         # Detect crossing the goal line inside the posts
         crossed_goal_line = (
@@ -258,20 +261,21 @@ class PassAndScoreEnv:
             self.goal_xmin <= s["pball"][0] <= self.goal_xmax and
             self.region_b.xmin <= s["pball"][0] <= self.region_b.xmax
         )
-        # NEW/CHANGED: only count as a goal if last touch was by B
-        if crossed_goal_line and (s.get("last_touch") == "B"):
+        # Only count as a goal if last touch was by B (if you have that rule)
+        is_goal = bool(crossed_goal_line and (s.get("last_touch", "B") == "B"))  # adapt if you removed last_touch
+
+        if is_goal:
             reward = 10.0
             terminated = True
-        # else: ball "goes through" the mouth with no bounce and no reward
 
         s["steps"] += 1
         truncated = (s["steps"] >= self.max_steps) and not terminated
 
         obs = self._get_obs()
-        # NEW/CHANGED: include extra flags and last_touch in info["after"]
         info_after = self._get_info()
         info_after["crossed_goal_mouth"] = bool(crossed_goal_line)
-        info_after["scored_goal"] = bool(crossed_goal_line and (s.get("last_touch") == "B"))
+        info_after["scored_goal"] = bool(is_goal)
+        info_after["left_regions"] = bool(left_regions)
         info["after"] = info_after
         return obs, reward, terminated, truncated, info
 

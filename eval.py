@@ -1,136 +1,112 @@
 #!/usr/bin/env python3
-import argparse, os, numpy as np
-import matplotlib.pyplot as plt
-import torch
-import sys
-
+import argparse, os, numpy as np, torch
 from env import PassAndScoreEnv
-from train import FactorizedPolicy, ValueNet  # new factorized actor + critic
-
-# ---------- Load actor & critic from PPO/factorized checkpoint ----------
-def load_actor_critic(ckpt_path, hidden=128, device="cpu"):
-    """
-    Expects a checkpoint saved by the new PPO + factorized-policy trainer, with keys:
-      {"actor": state_dict, "critic": state_dict, "obs_dim": int, "n_each": int}
-    """
-    ckpt = torch.load(ckpt_path, map_location=device)
-    if not (isinstance(ckpt, dict) and "actor" in ckpt and "critic" in ckpt):
-        raise ValueError("Checkpoint must contain 'actor' and 'critic' state dicts.")
-
-    obs_dim = int(ckpt["obs_dim"])
-    n_each  = int(ckpt["n_each"])
-
-    actor  = FactorizedPolicy(obs_dim, n_each=n_each, hidden=hidden).to(device)
-    critic = ValueNet(obs_dim, hidden=hidden).to(device)
-    actor.load_state_dict(ckpt["actor"], strict=True)
-    critic.load_state_dict(ckpt["critic"], strict=True)
-    actor.eval(); critic.eval()
-    return actor, critic, obs_dim, n_each
+from train import FactorizedPolicy, ValueNet  # uses your PPO factorized policy
 
 @torch.no_grad()
-def run_one_episode(actor, critic, seed=0, render_fps=30, max_steps=400, device="cpu",
-                    stochastic=True, print_prefix="[eval]"):
-    env = PassAndScoreEnv(centralized=True, seed=seed)
+def load_actor(ckpt_path, hidden=128, device="cpu"):
+    ckpt = torch.load(ckpt_path, map_location=device)
+    obs_dim = int(ckpt["obs_dim"])
+    n_each  = int(ckpt["n_each"])
+    actor = FactorizedPolicy(obs_dim, n_each=n_each, hidden=hidden).to(device)
+    actor.load_state_dict(ckpt["actor"], strict=True)
+    actor.eval()
+    return actor, obs_dim, n_each
+
+@torch.no_grad()
+def run_episode(env, actor, max_steps=1000, device="cpu", deterministic=False):
     obs, _ = env.reset()
+    steps = 0
+    scored_goal = False
+    left_regions = False
+    truncated = False
 
-    plt.ion()
-    dt = 1.0 / render_fps
-    ret = 0.0
-
-    # Create the figure once and watch for close events
-    env.render()                     # open the window once
-    fig = plt.gcf()
-    closed = False
-
-    def _on_close(evt):
-        nonlocal closed
-        closed = True
-
-    cid = fig.canvas.mpl_connect('close_event', _on_close)
-
-    for t in range(max_steps):
-        # If the user closed the window, stop BEFORE rendering again (so it won't reopen)
-        if closed or not plt.fignum_exists(fig.number):
-            print("\nWindow closed, exiting...")
-            break
-
-        # Compute value BEFORE acting (V(s_t))
+    while steps < max_steps:
         x = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        V = float(critic(x).item())
-
-        # Update render and overlay V(s)
-        env.render()  # update existing window
-        try:
-            ax = fig.axes[0] if fig.axes else None
-            if ax is not None:
-                title = ax.get_title()
-                ax.set_title(f"{title}   |   V(s)={V:.3f}" if title else f"V(s)={V:.3f}")
-        except Exception:
-            pass
-        plt.pause(dt)  # non-blocking GUI update
-
-        # Act with factorized policy (two Categorical heads)
         logitsA, logitsB = actor(x)
-        if stochastic:
+        if deterministic:
+            aA = int(torch.argmax(logitsA, dim=-1).item())
+            aB = int(torch.argmax(logitsB, dim=-1).item())
+        else:
             distA = torch.distributions.Categorical(logits=logitsA)
             distB = torch.distributions.Categorical(logits=logitsB)
             aA = int(distA.sample().item())
             aB = int(distB.sample().item())
-        else:
-            aA = int(torch.argmax(logitsA, dim=-1).item())
-            aB = int(torch.argmax(logitsB, dim=-1).item())
 
-        # Step
         obs, r, term, trunc, info = env.step((aA, aB))
-        ret += r
-        print(f"\r{print_prefix} step={t+1}/{max_steps}  reward={r:.3f}  return={ret:.3f}  V={V:.3f}",
-              end="", flush=True)
+        steps += 1
+
+        after = info.get("after", {})
+        # These flags are provided by the env patch above
+        if after.get("scored_goal", False):
+            scored_goal = True
+        if after.get("left_regions", False):
+            left_regions = True
+
         if term or trunc:
+            truncated = bool(trunc and not term)
             break
 
-    # Cleanup
-    plt.ioff()
-    try:
-        fig.canvas.mpl_disconnect(cid)
-    except Exception:
-        pass
-    try:
-        plt.close(fig)
-    except Exception:
-        pass
-    env.close()
-
-    if not (closed or term or trunc):
-        # Only print final return if we finished naturally
-        print(f"\n{print_prefix} return={ret:.3f}")
+    return {
+        "scored_goal": scored_goal,
+        "left_regions": left_regions,
+        "truncated": truncated,
+        "steps": steps,
+    }
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", required=True, help="Path to PPO checkpoint (policy.pth)")
+    p.add_argument("--ckpt", required=True, help="Path to checkpoint (policy.pth)")
+    p.add_argument("--episodes", type=int, default=200)
+    p.add_argument("--max-steps", type=int, default=400)
     p.add_argument("--device", default="cpu")
-    p.add_argument("--seed", type=int, default=None, help="Episode seed (default: random)")
-    p.add_argument("--fps", type=int, default=30, help="Render FPS")
-    p.add_argument("--max-steps", type=int, default=400, help="Max steps per episode")
-    p.add_argument("--deterministic", action="store_true", help="Greedy actions at eval time")
-    p.add_argument("--hidden", type=int, default=128, help="Hidden size (must match training)")
+    p.add_argument("--hidden", type=int, default=128, help="Hidden size used in training")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--deterministic", action="store_true", help="Greedy eval (default: stochastic)")
     args = p.parse_args()
 
-    if not os.path.exists(args.ckpt):
-        raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
 
-    actor, critic, _, _ = load_actor_critic(
-        args.ckpt, hidden=args.hidden, device=args.device
-    )
-    seed = args.seed if args.seed is not None else int(np.random.randint(0, 1_000_000))
-    run_one_episode(
-        actor, critic,
-        seed=seed,
-        render_fps=args.fps,
-        max_steps=args.max_steps,
-        device=args.device,
-        stochastic=(not args.deterministic),
-        print_prefix=f"[eval seed={seed}]",
-    )
+    if not os.path.exists(args.ckpt):
+        raise FileNotFoundError(args.ckpt)
+
+    actor, obs_dim, n_each = load_actor(args.ckpt, hidden=args.hidden, device=args.device)
+
+    goals = 0
+    leaves = 0
+    truncs = 0
+    steps_to_goal = []
+
+    for ep in range(args.episodes):
+        # use a different seed per episode for variety
+        env = PassAndScoreEnv(centralized=True, seed=(args.seed + ep))
+        result = run_episode(env, actor,
+                             max_steps=args.max_steps,
+                             device=args.device,
+                             deterministic=args.deterministic)
+        env.close()
+
+        goals += 1 if result["scored_goal"] else 0
+        leaves += 1 if result["left_regions"] else 0
+        truncs += 1 if result["truncated"] else 0
+        if result["scored_goal"]:
+            steps_to_goal.append(result["steps"])
+
+    n = float(args.episodes)
+    avg_goals = goals / n
+    avg_leaves = leaves / n
+    avg_truncs = truncs / n
+    avg_steps_to_goal = (float(np.mean(steps_to_goal)) if steps_to_goal else float("nan"))
+
+    print("\n=== EVAL SUMMARY ===")
+    print(f"Episodes:              {int(n)}")
+    print(f"Avg # goals/episode:   {avg_goals:.3f}")
+    print(f"Avg # leaves/episode:  {avg_leaves:.3f}")
+    print(f"Avg # truncs/episode:  {avg_truncs:.3f}")
+    if steps_to_goal:
+        print(f"Avg steps-to-goal:     {avg_steps_to_goal:.1f}  (over {len(steps_to_goal)} scoring eps)")
+    else:
+        print("Avg steps-to-goal:     N/A (no scoring episodes)")
 
 if __name__ == "__main__":
     main()
