@@ -1,0 +1,11 @@
+Virtual env
+source /Users/willi1/multi-agent-rl/PassAndScore/.venv/bin/activate
+cd GRF_MARL
+
+1. CTE (MAPPO): 
+python3 -m light_malib.main_pbt --config expr_configs/cooperative_MARL_benchmark/full_game/5_vs_5_hard/mappo.yaml
+
+2. CTDE (IPPO): 
+python3 -m light_malib.main_pbt --config expr_configs/cooperative_MARL_benchmark/full_game/5_vs_5_hard/ippo.yaml
+
+tensorboard --logdir logs/

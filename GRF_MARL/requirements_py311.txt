@@ -1,0 +1,27 @@
+# Modified requirements for Python 3.11
+ray>=2.5.0
+omegaconf>=2.0.6
+grpcio
+grpcio-tools
+protobuf>=3.20.0
+protobuf3-to-dict==0.1.5
+numpy
+tensorboardX>=2.1
+tensorboard
+readerwriterlock
+nashpy==0.0.21
+psutil>=5.8.0
+gym>=0.21.0,<0.26.0
+wrapt>=1.12.1
+pyyaml>=6.0
+dm-tree>=0.1.7
+parallel-ssh>=2.11.1
+tabulate>=0.8.10
+six>=1.16.0
+easydict>=1.9
+ipython
+colorlog>=6.6.0
+matplotlib>=3.5.3
+pandas>=1.5.1
+wandb
+
