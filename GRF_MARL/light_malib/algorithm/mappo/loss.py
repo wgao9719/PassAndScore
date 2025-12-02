@@ -572,36 +572,60 @@ class MAPPOLoss(LossFunc):
         
         B, Tp1, N, obs_dim = obs_batch.shape
         T = Tp1 - 1  # Actual trajectory length (last step is for bootstrapping)
-        batch_size = B
-        num_agents = N
         
         window_size = self._policy.custom_config.get("discriminator_window_size", 32)
         
-        Logger.info(f"[Discriminator] Full batch shape: B={B}, T+1={Tp1}, agents={N}, obs_dim={obs_dim}")
+        # CRITICAL: Use a larger batch size for stable discriminator training!
+        # With only B=5 rollout workers, we'd have very noisy gradients.
+        # Sample multiple windows from the trajectory to get a healthy batch size.
+        disc_batch_size = self._policy.custom_config.get("discriminator_batch_size", 64)
         
         if T < window_size:
-            Logger.warning(f"[Discriminator] T={T} < window={window_size}, skipping. Consider reducing discriminator_window_size.")
+            Logger.warning(f"[Discriminator] T={T} < window={window_size}, skipping.")
             return {}
         
-        # Use last window_size steps (excluding bootstrap step)
-        # obs_batch: [B, T+1, N, obs_dim] -> take [:, T-window:T, :, :]
-        # Result: [B, window, N, obs_dim] which is already [batch, window, agents, obs_dim]
-        start_idx = T - window_size
-        obs_window = obs_batch[:, start_idx:T, :, :]  # [B, window, N, obs_dim]
-        action_window = actions_batch[:, start_idx:T, :]  # [B, window, N]
-        
-        # Strategy code: same for all timesteps, take from first step, first agent
-        # strategy shape: [B, T, N] or similar -> take [:, 0, 0] = [B]
-        if len(strategy_code_batch.shape) == 3:
-            strategy = strategy_code_batch[:, 0, 0]  # [B]
-        elif len(strategy_code_batch.shape) == 4:
-            strategy = strategy_code_batch[:, 0, 0, 0]  # [B]
+        # Get strategy codes per rollout thread (same for all timesteps within a thread)
+        # strategy_code_batch shape: [B, T, N] or [B, T, N, 1]
+        if len(strategy_code_batch.shape) == 4:
+            strategies_per_thread = strategy_code_batch[:, 0, 0, 0]  # [B]
+        elif len(strategy_code_batch.shape) == 3:
+            strategies_per_thread = strategy_code_batch[:, 0, 0]  # [B]
         else:
-            strategy = strategy_code_batch.flatten()[:batch_size]
+            strategies_per_thread = strategy_code_batch.flatten()[:B]
         
-        # Compute loss
+        # Number of valid start positions for windows
+        num_valid_starts = T - window_size
+        
+        # Sample disc_batch_size random windows from the trajectory data
+        # Each window: random thread (0 to B-1) + random start time (0 to T-window)
+        thread_indices = torch.randint(0, B, (disc_batch_size,), device=obs_batch.device)
+        start_indices = torch.randint(0, num_valid_starts, (disc_batch_size,), device=obs_batch.device)
+        
+        # Build batch of trajectory windows
+        obs_windows = []
+        action_windows = []
+        strategy_targets = []
+        
+        for i in range(disc_batch_size):
+            t_idx = thread_indices[i].item()
+            s_idx = start_indices[i].item()
+            
+            # Extract window: [window_size, N, obs_dim]
+            obs_win = obs_batch[t_idx, s_idx:s_idx+window_size, :, :]
+            act_win = actions_batch[t_idx, s_idx:s_idx+window_size, :]
+            
+            obs_windows.append(obs_win)
+            action_windows.append(act_win)
+            strategy_targets.append(strategies_per_thread[t_idx])
+        
+        # Stack to get [disc_batch_size, window_size, N, obs_dim]
+        obs_windows = torch.stack(obs_windows)
+        action_windows = torch.stack(action_windows)
+        strategy_targets = torch.stack(strategy_targets)
+        
+        # Compute loss on the larger batch
         loss, accuracy = self._policy.discriminator.compute_loss(
-            obs_window, action_window, strategy
+            obs_windows, action_windows, strategy_targets
         )
         
         # Backward and update
@@ -617,7 +641,7 @@ class MAPPOLoss(LossFunc):
         loss_val = float(loss.detach().cpu().numpy())
         acc_val = float(accuracy.detach().cpu().numpy())
         
-        Logger.info(f"[Discriminator] UPDATED: loss={loss_val:.4f}, accuracy={acc_val:.4f}")
+        Logger.info(f"[Discriminator] UPDATED: batch={disc_batch_size}, loss={loss_val:.4f}, accuracy={acc_val:.4f}")
         
         return {
             "discriminator_loss": loss_val,

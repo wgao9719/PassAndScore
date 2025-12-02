@@ -265,6 +265,9 @@ populations:
         # Window size (sweet spot: 20-50 for GRF tactics)
         discriminator_window_size: 32       # ~3 seconds at 10Hz
         discriminator_use_actions: True     # Include actions in discriminator input
+        # Batch size for discriminator training (independent of num_workers)
+        # Larger = more stable gradients. 64-128 recommended.
+        discriminator_batch_size: 64
         
         other_clip_param: 0.125
 
