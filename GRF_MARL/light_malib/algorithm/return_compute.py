@@ -91,7 +91,7 @@ def compute_new_gae(policy, batch, use_old_V=False):
             )
             normalized_value=ret[EpisodeKey.STATE_VALUE]
         else:
-            normalized_value=ret[EpisodeKey.STATE_VALUE]
+            normalized_value=batch[EpisodeKey.STATE_VALUE]
 
         if cfg["use_popart"]:
             values = policy.value_normalizer.denormalize(

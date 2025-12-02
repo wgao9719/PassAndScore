@@ -85,7 +85,7 @@ rollout_manager:
       num_cpus: 1
       resources:
         - ["node:${distributed.nodes.master.ip}",0.01]
-  num_workers: 4
+  num_workers: 5
   seed: 12345
   saving_interval: 20
   batch_size: ${rollout_manager.num_workers}
@@ -129,9 +129,9 @@ rollout_manager:
       # Dense tactical rewards for supervisor (prevents posterior collapse)
       tactical_rewards:
         enabled: True
-        goal_coef: 1.0              # Weight for goal/score rewards
-        progression_coef: 0.1       # Weight for ball moving toward enemy goal
-        possession_coef: 0.05       # Weight for keeping the ball
+        goal_coef: 2.0              # Weight for goal/score rewards
+        progression_coef: 0.05       # Weight for ball moving toward enemy goal
+        possession_coef: 0.025       # Weight for keeping the ball
     rollout_func_name: "rollout_func"
     episode_mode: 'traj'
     envs:
@@ -151,7 +151,7 @@ rollout_manager:
           other_config_options:
             action_set: v2
         reward_config:
-          goal_reward: 0
+          goal_reward: 5.0
           official_reward: 1
     credit_reassign:
     decaying_exploration:
@@ -285,8 +285,8 @@ populations:
         use_cuda: False
         device: "cpu"
         use_q_head: False
-        ppo_epoch: 10
-        num_mini_batch: 2
+        ppo_epoch: 3              # Reduced for Phase 2 (supervisor is small)
+        num_mini_batch: 1         # Single batch (supervisor pools obs anyway)
         
         return_mode: new_gae
         gae:
@@ -316,7 +316,7 @@ populations:
             - condition: "==0"
               strategy: pretrained
               policy_id: phase1_trained
-              policy_dir: # TODO: Set path to Phase 1 checkpoint
+              policy_dir: /Users/willi1/multi-agent-rl/PassAndScore/GRF_MARL/logs/gr_football/full_game_5_vs_5_hard_mappo_phase1/2025-12-02-02-08-09/agent_0/agent_0-default-1/epoch_300
           initial_policies:
 
         agent_1:

@@ -499,7 +499,12 @@ def update_fields(data1, data2):
 
 def stack_step_data(step_data_list, bootstrap_data):
     episode_data = {}
-    for field in step_data_list[0]:
+    # Only stack fields present in ALL steps (handles supervisor_rnn_state etc.)
+    common_fields = set(step_data_list[0].keys())
+    for step_data in step_data_list[1:]:
+        common_fields &= set(step_data.keys())
+    
+    for field in common_fields:
         data_list = [step_data[field] for step_data in step_data_list]
         if field in bootstrap_data:
             data_list.append(bootstrap_data[field])
@@ -750,6 +755,8 @@ def rollout_func(
                     explore=not eval,
                     device=main_policy.device if main_policy else "cpu"
                 )
+                if step == 0:
+                    Logger.warning(f"[Phase2 Debug] Step {step}: Supervisor selected strategy={strategy_manager.current_strategy}")
         
         step_data = strategy_manager.attach(step_data)
         

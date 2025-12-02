@@ -206,9 +206,27 @@ class PolicyFactory:
         new_policy_id = self.default_policy_id(
             self.agent_id, self.population_id, new_policy_ctr
         )
-        policy = policy_cls.load(policy_dir, env_agent_id=self.agent_id)
-        if kwargs.get('reload_config', True):           #replace the policy cfg with the cfg in the yaml file
-            policy.custom_config = self.algorithm_cfg["custom_config"]
+        
+        # Pass current YAML config as override for Phase transitions
+        # This ensures supervisor/discriminator are created with Phase 2 settings
+        custom_config_override = {}
+        if kwargs.get('reload_config', True):
+            custom_config_override = self.algorithm_cfg.get("custom_config", {})
+        
+        policy = policy_cls.load(
+            policy_dir, 
+            env_agent_id=self.agent_id,
+            custom_config_override=custom_config_override
+        )
+        
+        # Update specific Phase 2 keys without replacing entire config
+        # (preserves Phase 1 trained settings like FiLM weights compatibility)
+        if kwargs.get('reload_config', True):
+            phase2_keys = ["training_phase", "use_supervisor", "supervisor_lr"]
+            for key in phase2_keys:
+                if key in self.algorithm_cfg.get("custom_config", {}):
+                    policy.custom_config[key] = self.algorithm_cfg["custom_config"][key]
+        
         Logger.warning(
             f"{self.agent_id}: {new_policy_id} is initialized from a pretrained model {policy_id}:{policy_dir}, cls = {policy_cls}"
         )

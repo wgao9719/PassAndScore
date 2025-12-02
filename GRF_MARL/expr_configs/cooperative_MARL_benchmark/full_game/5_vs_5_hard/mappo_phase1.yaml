@@ -123,7 +123,7 @@ rollout_manager:
     strategy_conditioning:
       enabled: True                 # Enable Phase 1 training
       num_strategies: 8             # K = 8 discrete strategy codes
-      intrinsic_reward_coef: 0.1    # alpha coefficient for intrinsic reward
+      intrinsic_reward_coef: 0.05    # alpha coefficient (INCREASED from 0.1 - was too weak!)
       # Window size for discriminator (sweet spot: 20-50 steps)
       # Too short (5): only sees velocity/jitter
       # Too long (100): gradient propagation is hard

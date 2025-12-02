@@ -255,25 +255,31 @@ class MAPPO(Policy):
         return states
     
     def freeze_players(self):
-        """Freeze player networks for Phase 2 training (supervisor only)."""
+        """
+        Freeze player networks for Phase 2 training.
+        
+        NOTE: Critic is NOT frozen! In Phase 2, we use a fresh critic to provide
+        baselines for supervisor PPO. This avoids PopArt mismatch issues.
+        """
         self._players_frozen = True
         for param in self.actor.parameters():
             param.requires_grad = False
-        for param in self.critic.parameters():
-            param.requires_grad = False
+        # DON'T freeze critic - it provides baselines for supervisor training
+        # and needs to adapt to the new reward structure
         if self.share_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
         if self.discriminator is not None:
             for param in self.discriminator.parameters():
                 param.requires_grad = False
-        Logger.info("Players frozen for Phase 2 training")
+        Logger.info("Players frozen for Phase 2 (actor, backbone, discriminator). Critic remains trainable.")
     
     def unfreeze_players(self):
         """Unfreeze player networks."""
         self._players_frozen = False
         for param in self.actor.parameters():
             param.requires_grad = True
+        # Critic is already unfrozen in Phase 2
         for param in self.critic.parameters():
             param.requires_grad = True
         if self.share_backbone:
@@ -520,6 +526,9 @@ class MAPPO(Policy):
             torch.save(self.discriminator.state_dict(), os.path.join(dump_dir, "discriminator.pt"))
         if self.supervisor is not None:
             torch.save(self.supervisor.state_dict(), os.path.join(dump_dir, "supervisor.pt"))
+        # Save PopArt value normalizer state (critical for correct value estimates!)
+        if self.custom_config.get("use_popart", False):
+            torch.save(self.value_normalizer.state_dict(), os.path.join(dump_dir, "popart.pt"))
         pickle.dump(self.description, open(os.path.join(dump_dir, "desc.pkl"), "wb"))
 
     @staticmethod
@@ -527,42 +536,107 @@ class MAPPO(Policy):
         with open(os.path.join(dump_dir, "desc.pkl"), "rb") as f:
             desc_pkl = pickle.load(f)
 
+        # Allow kwargs to override custom_config for Phase transitions
+        # This lets Phase 2 config (use_supervisor=True) override Phase 1 settings
+        custom_config = desc_pkl["custom_config"].copy()
+        custom_config_override = kwargs.pop("custom_config_override", {})
+        if custom_config_override:
+            Logger.info(f"[Policy.load] Overriding custom_config with: {custom_config_override}")
+            custom_config.update(custom_config_override)
+
         res = MAPPO(
             desc_pkl["registered_name"],
             desc_pkl["observation_space"],
             desc_pkl["action_space"],
             desc_pkl["model_config"],
-            desc_pkl["custom_config"],
+            custom_config,
             **kwargs,
         )
 
         # Load state_dict (we now save state_dict instead of entire model)
+        loaded = []
+        skipped = []
+        training_phase = custom_config.get("training_phase", "normal")
+        Logger.warning(f"[Policy.load] === LOADING FROM {dump_dir} (training_phase={training_phase}) ===")
+        
         actor_path = os.path.join(dump_dir, "actor.pt")
         if os.path.exists(actor_path):
             state_dict = torch.load(actor_path, map_location=res.device)
+            Logger.warning(f"[Policy.load] Actor checkpoint keys: {list(state_dict.keys())[:5]}... ({len(state_dict)} total)")
             res.actor.load_state_dict(state_dict)
-            
-        critic_path = os.path.join(dump_dir, "critic.pt")
-        if os.path.exists(critic_path):
-            state_dict = torch.load(critic_path, map_location=res.device)
-            res.critic.load_state_dict(state_dict)
+            # Print a sample weight to verify loading
+            sample_key = list(state_dict.keys())[0]
+            Logger.warning(f"[Policy.load] Actor sample weight '{sample_key}': mean={state_dict[sample_key].mean():.4f}, std={state_dict[sample_key].std():.4f}")
+            loaded.append("actor")
+        else:
+            Logger.warning(f"[Policy.load] Actor NOT FOUND at {actor_path}")
+        
+        # Phase 2: Skip critic loading - use fresh critic for supervisor baselines
+        # This avoids PopArt mismatch issues entirely
+        if training_phase == "phase2":
+            Logger.warning(f"[Policy.load] Phase 2: SKIPPING critic (using fresh critic for supervisor baselines)")
+            skipped.append("critic")
+        else:
+            critic_path = os.path.join(dump_dir, "critic.pt")
+            if os.path.exists(critic_path):
+                state_dict = torch.load(critic_path, map_location=res.device)
+                Logger.warning(f"[Policy.load] Critic checkpoint keys: {list(state_dict.keys())[:5]}... ({len(state_dict)} total)")
+                res.critic.load_state_dict(state_dict)
+                sample_key = list(state_dict.keys())[0]
+                Logger.warning(f"[Policy.load] Critic sample weight '{sample_key}': mean={state_dict[sample_key].mean():.4f}, std={state_dict[sample_key].std():.4f}")
+                loaded.append("critic")
+            else:
+                Logger.warning(f"[Policy.load] Critic NOT FOUND at {critic_path}")
         
         if res.share_backbone:
             backbone_path = os.path.join(dump_dir, "backbone.pt")
             if os.path.exists(backbone_path):
                 state_dict = torch.load(backbone_path, map_location=res.device)
+                Logger.warning(f"[Policy.load] Backbone checkpoint keys: {list(state_dict.keys())}")
                 res.backbone.load_state_dict(state_dict)
+                loaded.append("backbone")
+            else:
+                Logger.warning(f"[Policy.load] Backbone NOT FOUND at {backbone_path}")
         
         if res.discriminator is not None:
             discriminator_path = os.path.join(dump_dir, "discriminator.pt")
             if os.path.exists(discriminator_path):
                 state_dict = torch.load(discriminator_path, map_location=res.device)
+                Logger.warning(f"[Policy.load] Discriminator loaded ({len(state_dict)} params)")
                 res.discriminator.load_state_dict(state_dict)
+                loaded.append("discriminator")
+            else:
+                Logger.warning(f"[Policy.load] Discriminator NOT FOUND")
         
         if res.supervisor is not None:
             supervisor_path = os.path.join(dump_dir, "supervisor.pt")
             if os.path.exists(supervisor_path):
                 state_dict = torch.load(supervisor_path, map_location=res.device)
                 res.supervisor.load_state_dict(state_dict)
-                
+                loaded.append("supervisor")
+            else:
+                Logger.warning(f"[Policy.load] No supervisor.pt found - supervisor initialized randomly")
+        
+        # Load PopArt value normalizer
+        # Phase 2: Skip PopArt loading - fresh critic needs fresh normalizer
+        if training_phase == "phase2":
+            Logger.warning(f"[Policy.load] Phase 2: SKIPPING PopArt (fresh critic uses fresh normalizer)")
+            skipped.append("popart")
+        elif res.custom_config.get("use_popart", False):
+            popart_path = os.path.join(dump_dir, "popart.pt")
+            if os.path.exists(popart_path):
+                state_dict = torch.load(popart_path, map_location=res.device)
+                Logger.warning(f"[Policy.load] PopArt state: {state_dict}")
+                res.value_normalizer.load_state_dict(state_dict)
+                loaded.append("popart")
+            else:
+                Logger.warning(f"[Policy.load] No popart.pt - using fresh normalizer (mean=0, std=1)")
+        
+        # Print FiLM generator state if present (critical for strategy conditioning)
+        if hasattr(res.actor, 'film_generator') and res.actor.film_generator is not None:
+            fg = res.actor.film_generator
+            embed_weight = fg.strategy_embedding.weight
+            Logger.warning(f"[Policy.load] FiLM embedding shape: {embed_weight.shape}, mean={embed_weight.mean():.4f}")
+        
+        Logger.warning(f"[Policy.load] === LOADED: {loaded}, SKIPPED: {skipped} ===")
         return res

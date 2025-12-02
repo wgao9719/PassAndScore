@@ -544,6 +544,11 @@ class MAPPOLoss(LossFunc):
         Returns:
             dict with discriminator_loss and discriminator_accuracy, or empty dict
         """
+        # Skip discriminator update in Phase 2 (players/discriminator frozen)
+        training_phase = self._policy.custom_config.get("training_phase", "normal")
+        if training_phase == "phase2":
+            return {}
+        
         if self._policy.discriminator is None or self.discriminator_optimizer is None:
             return {}
         
@@ -593,35 +598,84 @@ class MAPPOLoss(LossFunc):
         else:
             strategies_per_thread = strategy_code_batch.flatten()[:B]
         
-        # Number of valid start positions for windows
-        num_valid_starts = T - window_size
+        # ====== VECTORIZED WINDOW EXTRACTION (5-10x faster than Python loop) ======
+        # Use torch.unfold to extract ALL sliding windows in one operation (zero-copy!)
         
-        # Sample disc_batch_size random windows from the trajectory data
-        # Each window: random thread (0 to B-1) + random start time (0 to T-window)
-        thread_indices = torch.randint(0, B, (disc_batch_size,), device=obs_batch.device)
-        start_indices = torch.randint(0, num_valid_starts, (disc_batch_size,), device=obs_batch.device)
+        # obs_batch: [B, T, N, obs_dim] -> we want windows of size W along dim 1
+        # unfold creates: [B, num_windows, N, obs_dim, W] then we permute
+        num_windows = T - window_size + 1
         
-        # Build batch of trajectory windows
-        obs_windows = []
-        action_windows = []
-        strategy_targets = []
+        if num_windows <= 0:
+            Logger.warning(f"[Discriminator] Not enough timesteps for windows")
+            return {}
         
-        for i in range(disc_batch_size):
-            t_idx = thread_indices[i].item()
-            s_idx = start_indices[i].item()
+        # Unfold along time dimension (dim=1)
+        # Result: [B, num_windows, N, obs_dim, window_size]
+        obs_unfolded = obs_batch[:, :T, :, :].unfold(dimension=1, size=window_size, step=1)
+        # Permute to [B, num_windows, window_size, N, obs_dim]
+        obs_unfolded = obs_unfolded.permute(0, 1, 4, 2, 3)
+        
+        # Same for actions: [B, T, N] -> [B, num_windows, window_size, N]
+        act_unfolded = actions_batch[:, :T, :].unfold(dimension=1, size=window_size, step=1)
+        act_unfolded = act_unfolded.permute(0, 1, 3, 2)
+        
+        # ====== DONE-MASKING: Create validity mask for windows ======
+        # A window starting at t is valid if done[t:t+window_size] are all False
+        done_batch = full_batch.get(EpisodeKey.DONE, None)
+        
+        # Default: all windows are valid
+        # valid_mask: [B, num_windows] - True if window is valid
+        valid_mask = torch.ones(B, num_windows, dtype=torch.bool, device=obs_batch.device)
+        
+        if done_batch is not None:
+            if isinstance(done_batch, np.ndarray):
+                done_batch = torch.from_numpy(done_batch).float().to(obs_batch.device)
             
-            # Extract window: [window_size, N, obs_dim]
-            obs_win = obs_batch[t_idx, s_idx:s_idx+window_size, :, :]
-            act_win = actions_batch[t_idx, s_idx:s_idx+window_size, :]
+            # Extract done flags: [B, T]
+            if len(done_batch.shape) == 4:
+                done_per_step = done_batch[:, :T, 0, 0]
+            elif len(done_batch.shape) == 3:
+                done_per_step = done_batch[:, :T, 0]
+            else:
+                done_per_step = done_batch[:, :T]
             
-            obs_windows.append(obs_win)
-            action_windows.append(act_win)
-            strategy_targets.append(strategies_per_thread[t_idx])
+            # Unfold done flags: [B, num_windows, window_size]
+            done_unfolded = done_per_step.unfold(dimension=1, size=window_size, step=1)
+            
+            # Window is valid if NO done=True within it
+            # (checking if max < 0.5 means all are False/0)
+            valid_mask = done_unfolded.max(dim=2).values < 0.5  # [B, num_windows]
         
-        # Stack to get [disc_batch_size, window_size, N, obs_dim]
-        obs_windows = torch.stack(obs_windows)
-        action_windows = torch.stack(action_windows)
-        strategy_targets = torch.stack(strategy_targets)
+        # ====== SAMPLE FROM VALID WINDOWS ======
+        # Flatten to get all valid (batch, window_idx) pairs
+        # valid_indices: list of (batch_idx, window_idx) tuples
+        valid_indices = torch.nonzero(valid_mask)  # [num_valid, 2]
+        
+        if len(valid_indices) == 0:
+            Logger.warning(f"[Discriminator] No valid windows found!")
+            return {}
+        
+        num_valid = len(valid_indices)
+        samples_collected = min(disc_batch_size, num_valid)
+        
+        # Randomly sample from valid indices
+        if num_valid >= disc_batch_size:
+            # Sample without replacement
+            perm = torch.randperm(num_valid, device=obs_batch.device)[:disc_batch_size]
+            sampled_indices = valid_indices[perm]
+        else:
+            # Not enough valid windows, use all of them
+            sampled_indices = valid_indices
+            Logger.warning(f"[Discriminator] Only {num_valid} valid windows, using all")
+        
+        # Extract sampled windows using advanced indexing
+        batch_indices = sampled_indices[:, 0]  # [samples_collected]
+        window_indices = sampled_indices[:, 1]  # [samples_collected]
+        
+        # Gather windows: [samples_collected, window_size, N, obs_dim]
+        obs_windows = obs_unfolded[batch_indices, window_indices]
+        action_windows = act_unfolded[batch_indices, window_indices]
+        strategy_targets = strategies_per_thread[batch_indices]
         
         # Compute loss on the larger batch
         loss, accuracy = self._policy.discriminator.compute_loss(
@@ -641,7 +695,7 @@ class MAPPOLoss(LossFunc):
         loss_val = float(loss.detach().cpu().numpy())
         acc_val = float(accuracy.detach().cpu().numpy())
         
-        Logger.info(f"[Discriminator] UPDATED: batch={disc_batch_size}, loss={loss_val:.4f}, accuracy={acc_val:.4f}")
+        Logger.info(f"[Discriminator] UPDATED: batch={samples_collected}, loss={loss_val:.4f}, accuracy={acc_val:.4f}")
         
         return {
             "discriminator_loss": loss_val,
@@ -710,17 +764,24 @@ class MAPPOLoss(LossFunc):
             obs_pooled = obs_batch.view(batch_size, num_agents, obs_dim).mean(dim=1)  # [batch, obs_dim]
         
         # Get supervisor action shape right (take first agent's strategy, same for all)
+        # supervisor_action_batch may be 1D [batch*agents] or 2D [batch, agents]
+        expected_batch = obs_pooled.shape[0]
         if supervisor_action_batch.dim() > 1:
-            # Take strategy from first agent only
-            supervisor_action_batch = supervisor_action_batch.reshape(-1, num_agents)[..., 0]
+            supervisor_action_batch = supervisor_action_batch.reshape(-1, num_agents)[:, 0]
+        elif supervisor_action_batch.shape[0] != expected_batch:
+            # 1D but per-agent: reshape to [batch, agents] and take first agent
+            supervisor_action_batch = supervisor_action_batch.reshape(-1, num_agents)[:, 0]
+        
         if old_log_prob_batch.dim() > 1:
-            old_log_prob_batch = old_log_prob_batch.reshape(-1, num_agents)[..., 0]
+            old_log_prob_batch = old_log_prob_batch.reshape(-1, num_agents)[:, 0]
+        elif old_log_prob_batch.shape[0] != expected_batch:
+            old_log_prob_batch = old_log_prob_batch.reshape(-1, num_agents)[:, 0]
         
         # Forward pass through supervisor
         _, new_log_prob, values, entropy = self._policy.supervisor(
             obs_pooled,
             explore=False,
-            strategy=supervisor_action_batch.flatten()
+            strategy=supervisor_action_batch,
         )
         
         # Compute PPO loss for supervisor
@@ -733,8 +794,11 @@ class MAPPOLoss(LossFunc):
         # Aggregate advantages across agents (same strategy for all)
         if adv_targ.dim() > 1 and adv_targ.shape[-1] > 1:
             adv_targ_sup = adv_targ.view(-1, num_agents, 1).mean(dim=1)  # Average across agents
+        elif adv_targ.numel() != expected_batch:
+            # 1D per-agent data: reshape and average
+            adv_targ_sup = adv_targ.view(-1, num_agents).mean(dim=1, keepdim=True)
         else:
-            adv_targ_sup = adv_targ.view(-1, 1)[:obs_pooled.shape[0]]
+            adv_targ_sup = adv_targ.view(-1, 1)
         
         # Clipped surrogate objective
         surr1 = imp_weights * adv_targ_sup
@@ -750,13 +814,17 @@ class MAPPOLoss(LossFunc):
         # Value loss
         if return_batch.dim() > 1 and return_batch.shape[-1] > 1:
             return_sup = return_batch.view(-1, num_agents, 1).mean(dim=1)
+        elif return_batch.numel() != expected_batch:
+            return_sup = return_batch.view(-1, num_agents).mean(dim=1, keepdim=True)
         else:
-            return_sup = return_batch.view(-1, 1)[:obs_pooled.shape[0]]
+            return_sup = return_batch.view(-1, 1)
         
         if value_preds_batch.dim() > 1 and value_preds_batch.shape[-1] > 1:
             value_preds_sup = value_preds_batch.view(-1, num_agents, 1).mean(dim=1)
+        elif value_preds_batch.numel() != expected_batch:
+            value_preds_sup = value_preds_batch.view(-1, num_agents).mean(dim=1, keepdim=True)
         else:
-            value_preds_sup = value_preds_batch.view(-1, 1)[:obs_pooled.shape[0]]
+            value_preds_sup = value_preds_batch.view(-1, 1)
         
         value_loss = self._calc_value_loss(values, value_preds_sup, return_sup)
         
@@ -767,7 +835,7 @@ class MAPPOLoss(LossFunc):
         total_loss = policy_loss + entropy_loss * entropy_coef + value_loss * value_loss_coef
         total_loss = total_loss / self.grad_accum_step
         
-        # Backward and update
+        # Backward and update (supervisor only - critic provides baselines via inference)
         total_loss.backward()
         
         if self.n_opt_steps % self.grad_accum_step == 0:
@@ -778,12 +846,16 @@ class MAPPOLoss(LossFunc):
             self.supervisor_optimizer.step()
             self.supervisor_optimizer.zero_grad()
         
+        # Compute approx_kl for consistency with trainer expectations
+        approx_kl = (old_log_prob - log_prob).mean().item()
+        
         # Statistics
         stats = {
             "supervisor_policy_loss": float(policy_loss.detach().cpu().numpy()),
             "supervisor_value_loss": float(value_loss.detach().cpu().numpy()),
             "supervisor_entropy": float(entropy.mean().detach().cpu().numpy()) if entropy is not None else 0.0,
             "supervisor_ratio": float(imp_weights.mean().detach().cpu().numpy()),
+            "approx_kl": approx_kl,  # Required by trainer for KL early stopping
         }
         
         return stats

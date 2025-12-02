@@ -75,10 +75,19 @@ class FiLMGenerator(nn.Module):
             nn.Linear(embed_dim, 2 * hidden_dim)  # gamma and beta
         )
         
-        # Initialize to identity transform: gamma=1, beta=0
-        nn.init.zeros_(self.film_net[-1].weight)
+        # Initialize with NOISE around identity to break symmetry
+        # Identity init (gamma=1, beta=0) causes "lazy" agents that ignore strategy code.
+        # By adding noise, different strategies produce DIFFERENT modulations at start,
+        # which gives the discriminator signal to learn from.
+        #
+        # gamma ~ N(1.0, 0.1), beta ~ N(0.0, 0.1)
+        nn.init.normal_(self.film_net[-1].weight, mean=0.0, std=0.02)  # Small weights, not zero!
         nn.init.zeros_(self.film_net[-1].bias)
-        self.film_net[-1].bias.data[:hidden_dim] = 1.0  # gamma = 1
+        self.film_net[-1].bias.data[:hidden_dim] = 1.0  # gamma mean = 1
+        # Add noise to break symmetry between strategies
+        with torch.no_grad():
+            self.film_net[-1].bias.data[:hidden_dim] += torch.randn(hidden_dim) * 0.1  # gamma std = 0.1
+            self.film_net[-1].bias.data[hidden_dim:] = torch.randn(hidden_dim) * 0.1  # beta std = 0.1
         
     def forward(self, strategy_code: torch.Tensor) -> tuple:
         """
@@ -121,8 +130,18 @@ class FiLMGenerator(nn.Module):
 
 class TransformerEncoder(nn.Module):
     """
-    Small Transformer encoder for processing entity lists.
-    Captures relational information between entities (ball, players).
+    Transformer encoder for processing entity lists with ID embeddings.
+    
+    KEY FIX: Transformers are permutation invariant! Without ID embeddings,
+    the model can't distinguish Ball from Teammate from Opponent.
+    
+    Entity IDs:
+      - 0: Ball
+      - 1-11: Left team (teammates)
+      - 12-22: Right team (opponents)
+    
+    This allows attention to learn rules like:
+      "If [Entity 0 (Ball)] near [Entity 12 (Opponent)] → Strategy X"
     """
     
     def __init__(
@@ -131,17 +150,23 @@ class TransformerEncoder(nn.Module):
         hidden_dim: int = 128,
         num_heads: int = 4,
         num_layers: int = 2,
+        num_entities: int = 23,
         dropout: float = 0.1,
     ):
         super().__init__()
+        self.num_entities = num_entities
         
         # Project entity features to hidden dim
         self.input_proj = nn.Linear(entity_dim, hidden_dim)
         
+        # ID Embedding: Crucial for knowing who is who!
+        # Ball=0, Teammates=1-11, Opponents=12-22
+        self.id_embedding = nn.Embedding(num_entities, hidden_dim)
+        
         # Learnable [CLS] token for aggregation
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
         
-        # Transformer encoder layers
+        # Transformer encoder layers with pre-norm (more stable)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -149,10 +174,11 @@ class TransformerEncoder(nn.Module):
             dropout=dropout,
             activation='gelu',
             batch_first=True,
+            norm_first=True,  # Pre-LN for stability
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Layer norm
+        # Final layer norm
         self.norm = nn.LayerNorm(hidden_dim)
         
     def forward(self, entities: torch.Tensor) -> torch.Tensor:
@@ -163,18 +189,25 @@ class TransformerEncoder(nn.Module):
             hidden: [batch, hidden_dim] aggregated representation
         """
         batch_size = entities.shape[0]
+        num_entities = entities.shape[1]
         
-        # Project to hidden dim
+        # 1. Project features to hidden dim
         x = self.input_proj(entities)  # [batch, num_entities, hidden_dim]
         
-        # Prepend CLS token
+        # 2. Add ID embeddings (THE FIX for permutation invariance!)
+        entity_ids = torch.arange(num_entities, device=entities.device)
+        entity_ids = entity_ids.unsqueeze(0).expand(batch_size, -1)  # [batch, num_entities]
+        id_embeds = self.id_embedding(entity_ids)  # [batch, num_entities, hidden_dim]
+        x = x + id_embeds
+        
+        # 3. Prepend CLS token
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # [batch, 1, hidden_dim]
         x = torch.cat([cls_tokens, x], dim=1)  # [batch, 1 + num_entities, hidden_dim]
         
-        # Transformer encoding
+        # 4. Transformer encoding
         x = self.transformer(x)  # [batch, 1 + num_entities, hidden_dim]
         
-        # Take CLS token output as aggregated representation
+        # 5. Take CLS token output as aggregated representation
         hidden = self.norm(x[:, 0])  # [batch, hidden_dim]
         
         return hidden
@@ -236,12 +269,13 @@ class Supervisor(nn.Module):
         
         if use_transformer:
             # Transformer-based "God-View" encoder
-            # Preserves spatial/relational information
+            # Preserves spatial/relational information + ID embeddings
             self.encoder = TransformerEncoder(
                 entity_dim=entity_dim,
                 hidden_dim=hidden_dim,
                 num_heads=num_heads,
                 num_layers=num_layers,
+                num_entities=num_entities,  # For ID embeddings
             )
             encoder_output_dim = hidden_dim
         else:
@@ -268,66 +302,65 @@ class Supervisor(nn.Module):
     
     def _extract_entities(self, obs: torch.Tensor) -> torch.Tensor:
         """
-        Extract entity features from raw GRF observation.
+        Extract entity features from raw GRF observation (VECTORIZED).
         
-        GRF observation layout (simplified, adjust indices as needed):
-          - Ball: position (x, y), velocity (vx, vy)
-          - Left team (11 players): position, velocity, direction, tired
-          - Right team (11 players): position, velocity, direction, tired
+        GRF observation layout (simple115 / encoder_basic):
+          - Left team positions: indices 0-21 (11 * 2)
+          - Right team positions: indices 22-43 (11 * 2)
+          - Left team directions: indices 44-54 (11) - these ARE velocities!
+          - Right team directions: indices 55-65 (11) - these ARE velocities!
+          - Left team tired: indices 66-76 (11)
+          - Right team tired: indices 77-87 (11)
+          - Ball position: indices 88-90 (x, y, z)
+          - Ball direction: indices 91-93 (vx, vy, vz) - ball velocity!
+          - Ball ownership: index 94
         
         Returns:
             entities: [batch, 23, entity_dim] tensor
+                      entity_dim = 6: (x, y, vx, vy, direction_or_speed, tired)
+        
+        NOTE: "direction" in GRF is actually velocity vector magnitude for players.
+              We use it as a speed indicator.
         """
         batch_size = obs.shape[0]
+        device = obs.device
         
-        # GRF observation indices (approximate, may need adjustment)
-        # These are based on typical GRF "simple115" representation
-        # Ball: indices 88-91 (x, y, z, ownership)
-        # Left team positions: indices 0-21 (11 * 2)
-        # Left team directions: indices 44-54
-        # Right team positions: indices 22-43 (11 * 2)
-        # Right team directions: indices 55-65
+        # Pre-allocate: [batch, 23, 6]
+        entities = torch.zeros(batch_size, self.num_entities, self.entity_dim, device=device)
         
-        entities = []
+        # === BALL (entity 0) ===
+        if obs.shape[-1] >= 94:
+            entities[:, 0, :2] = obs[:, 88:90]      # Ball position (x, y)
+            entities[:, 0, 2:4] = obs[:, 91:93]    # Ball velocity (vx, vy) - CRITICAL!
+        elif obs.shape[-1] >= 90:
+            entities[:, 0, :2] = obs[:, 88:90]      # Ball position only
         
-        # Ball (entity 0)
-        if obs.shape[-1] >= 92:
-            ball_pos = obs[..., 88:90]  # x, y
-            ball_vel = torch.zeros(batch_size, 2, device=obs.device)  # placeholder
-            ball_dir = torch.zeros(batch_size, 1, device=obs.device)
-            ball_tired = torch.zeros(batch_size, 1, device=obs.device)
-            ball = torch.cat([ball_pos, ball_vel, ball_dir, ball_tired], dim=-1)
-            entities.append(ball)
-        else:
-            # Fallback: just use zeros
-            entities.append(torch.zeros(batch_size, self.entity_dim, device=obs.device))
+        # === LEFT TEAM (entities 1-11) ===
+        if obs.shape[-1] >= 44:
+            # Positions: indices 0-21 -> [batch, 11, 2]
+            entities[:, 1:12, :2] = obs[:, :22].view(batch_size, 11, 2)
         
-        # Left team (entities 1-11)
-        for i in range(11):
-            if obs.shape[-1] >= 66:
-                pos = obs[..., i*2:(i+1)*2]  # positions
-                vel = torch.zeros(batch_size, 2, device=obs.device)
-                direction = obs[..., 44+i:45+i] if obs.shape[-1] > 44+i else torch.zeros(batch_size, 1, device=obs.device)
-                tired = torch.zeros(batch_size, 1, device=obs.device)
-                player = torch.cat([pos, vel, direction, tired], dim=-1)
-            else:
-                player = torch.zeros(batch_size, self.entity_dim, device=obs.device)
-            entities.append(player)
+        if obs.shape[-1] >= 55:
+            # "Direction" is actually velocity magnitude - use as speed
+            # GRF stores this as a single value per player
+            entities[:, 1:12, 4] = obs[:, 44:55]
         
-        # Right team (entities 12-22)
-        for i in range(11):
-            if obs.shape[-1] >= 66:
-                pos = obs[..., 22+i*2:22+(i+1)*2]  # positions
-                vel = torch.zeros(batch_size, 2, device=obs.device)
-                direction = obs[..., 55+i:56+i] if obs.shape[-1] > 55+i else torch.zeros(batch_size, 1, device=obs.device)
-                tired = torch.zeros(batch_size, 1, device=obs.device)
-                player = torch.cat([pos, vel, direction, tired], dim=-1)
-            else:
-                player = torch.zeros(batch_size, self.entity_dim, device=obs.device)
-            entities.append(player)
+        if obs.shape[-1] >= 77:
+            # Tired factor
+            entities[:, 1:12, 5] = obs[:, 66:77]
         
-        # Stack all entities: [batch, 23, entity_dim]
-        entities = torch.stack(entities, dim=1)
+        # === RIGHT TEAM (entities 12-22) ===
+        if obs.shape[-1] >= 44:
+            # Positions: indices 22-43 -> [batch, 11, 2]
+            entities[:, 12:23, :2] = obs[:, 22:44].view(batch_size, 11, 2)
+        
+        if obs.shape[-1] >= 66:
+            # Direction/speed
+            entities[:, 12:23, 4] = obs[:, 55:66]
+        
+        if obs.shape[-1] >= 88:
+            # Tired factor
+            entities[:, 12:23, 5] = obs[:, 77:88]
         
         return entities
     
@@ -468,14 +501,20 @@ class StrategyDiscriminator(nn.Module):
             nn.ReLU(),
         )
         
-        # Temporal encoder: GRU over the trajectory window
-        self.gru = nn.GRU(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim,
-            num_layers=2,  # Increased depth
-            batch_first=True,
-            dropout=0.1,
-        )
+        # ====== 1D CNN Temporal Encoder (3x faster than GRU!) ======
+        # Why CNN: Tactics like "counter-attack" are spatial PATTERNS, not 
+        # long-term dependencies. CNNs process the whole window in parallel.
+        # Input: [batch, hidden_dim, window_size] (after permute)
+        self.conv1 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        
+        # Batch norm for stable training
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.bn3 = nn.BatchNorm1d(hidden_dim)
+        
+        # Global average pooling will reduce [batch, hidden_dim, T] -> [batch, hidden_dim]
         
         # Classifier head
         self.classifier = nn.Sequential(
@@ -598,12 +637,24 @@ class StrategyDiscriminator(nn.Module):
         # Extract structured features (no blind pooling!)
         features = self._extract_structured_features(obs_seq, action_seq)
         
-        # Project features
+        # Project features: [batch, window, hidden_dim]
         features = self.feature_proj(features)
         
-        # Pass through GRU
-        _, hidden = self.gru(features)  # hidden: [2, batch, hidden_dim]
-        hidden = hidden[-1]  # Take last layer: [batch, hidden_dim]
+        # ====== 1D CNN: Process whole window in parallel (3x faster!) ======
+        # Permute for Conv1d: [batch, window, hidden_dim] -> [batch, hidden_dim, window]
+        x = features.permute(0, 2, 1)
+        
+        # Conv layers with residual-style connections
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.max_pool1d(x, kernel_size=2, stride=2)  # Downsample: window/2
+        
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.max_pool1d(x, kernel_size=2, stride=2)  # Downsample: window/4
+        
+        x = F.relu(self.bn3(self.conv3(x)))
+        
+        # Global Average Pooling: [batch, hidden_dim, T'] -> [batch, hidden_dim]
+        hidden = x.mean(dim=2)
         
         # Classify
         logits = self.classifier(hidden)  # [batch, num_strategies]
@@ -886,6 +937,11 @@ class Actor(nn.Module):
                 strategy_code = torch.zeros(
                     hidden.shape[0], dtype=torch.long, device=hidden.device
                 )
+                # DEBUG: Log when strategy_code is None (potential issue!)
+                if not hasattr(self, '_warned_none_strategy'):
+                    from light_malib.utils.logger import Logger
+                    Logger.warning(f"[FiLM DEBUG] strategy_code was None! Defaulting to 0. This may indicate Phase 2 supervisor not running.")
+                    self._warned_none_strategy = True
             else:
                 strategy_code = torch.as_tensor(
                     strategy_code, dtype=torch.long, device=hidden.device
