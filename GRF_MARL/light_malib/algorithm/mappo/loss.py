@@ -142,6 +142,30 @@ class MAPPOLoss(LossFunc):
         
         self.optimizer.zero_grad()
         
+        # Discriminator optimizer for Phase 1 strategy conditioning
+        self.discriminator_optimizer = None
+        if self._policy.discriminator is not None:
+            discriminator_lr = self._params.get("discriminator_lr", self._params["actor_lr"])
+            self.discriminator_optimizer = optim_cls(
+                self._policy.discriminator.parameters(),
+                lr=discriminator_lr,
+                eps=self._params["opti_eps"],
+                weight_decay=self._params["weight_decay"]
+            )
+            self.discriminator_optimizer.zero_grad()
+        
+        # Supervisor optimizer for Phase 2 training
+        self.supervisor_optimizer = None
+        if self._policy.supervisor is not None:
+            supervisor_lr = self._params.get("supervisor_lr", self._params["actor_lr"])
+            self.supervisor_optimizer = optim_cls(
+                self._policy.supervisor.parameters(),
+                lr=supervisor_lr,
+                eps=self._params["opti_eps"],
+                weight_decay=self._params["weight_decay"]
+            )
+            self.supervisor_optimizer.zero_grad()
+        
         self.n_opt_steps=0
         self.grad_accum_step=self._params.get("grad_accum_step",1)
         
@@ -149,8 +173,15 @@ class MAPPOLoss(LossFunc):
         self.n_opt_steps+=1
         
         policy = self._policy
-        policy.train()                
-        if self._use_seq:
+        policy.train()
+        
+        # Check training phase
+        training_phase = policy.custom_config.get("training_phase", "normal")
+        
+        if training_phase == "phase2":
+            # Phase 2: Train supervisor only, players are frozen
+            return self.loss_compute_supervisor(sample)
+        elif self._use_seq:
             return self.loss_compute_sequential(sample)
         else:
             return self.loss_compute_simultaneous(sample)
@@ -214,6 +245,9 @@ class MAPPOLoss(LossFunc):
             sample[EpisodeKey.ADVANTAGE],
             sample["delta"],
         )
+        
+        # Strategy conditioning data (Phase 1)
+        strategy_code_batch = sample.get(EpisodeKey.STRATEGY_CODE, None)
 
         if update_actor:
             action_kwargs = {
@@ -227,6 +261,8 @@ class MAPPOLoss(LossFunc):
             }
             if flash_batch is not None:
                 action_kwargs[EpisodeKey.FLASH_TOKEN] = flash_batch
+            if strategy_code_batch is not None:
+                action_kwargs[EpisodeKey.STRATEGY_CODE] = strategy_code_batch
             ret = self._policy.compute_action(
                 **action_kwargs,
                 inference=False,
@@ -359,6 +395,12 @@ class MAPPOLoss(LossFunc):
             
             self.optimizer.step()
             self.optimizer.zero_grad()
+        
+        # ============================== Discriminator Update (Phase 1) ================================
+        # NOTE: Discriminator is now updated via update_discriminator_with_trajectory() 
+        # which is called from the trainer with the FULL trajectory batch.
+        # Mini-batched data loses temporal structure needed for discriminator.
+        # Stats are added there instead.
 
         # ============================== Statistics ================================
         if update_actor:
@@ -385,9 +427,341 @@ class MAPPOLoss(LossFunc):
                 (imp_weights < (1 - self.clip_param)).float().mean()
             )
             stats["clip_ratio"] = stats["upper_clip_ratio"] + stats["lower_clip_ratio"]
+            
+            # NOTE: Discriminator stats are now added by update_discriminator_with_trajectory()
+            # which is called from the trainer with full trajectory data.
         else:
             stats = {}
             
+        return stats
+    
+    def _update_discriminator(self, sample, strategy_code_batch):
+        """
+        Update the discriminator to predict strategy code from trajectory.
+        
+        The discriminator learns: q(c | trajectory) 
+        This provides the intrinsic reward gradient for the policy.
+        
+        Returns:
+            loss: float, the discriminator loss
+            accuracy: float, the classification accuracy
+        """
+        if self._policy.discriminator is None:
+            return None, None
+        
+        # Get observations and actions from the sample
+        # Sample shape is typically [T, batch*agents, dim] for trajectories
+        obs_batch = sample[EpisodeKey.CUR_OBS]
+        actions_batch = sample[EpisodeKey.ACTION].long()
+        
+        # Reshape for discriminator: need [batch, window, agents, dim]
+        # The sample is from a trajectory, so we can use consecutive steps
+        num_agents = self._policy.custom_config.get("num_agents", 4)
+        window_size = self._policy.custom_config.get("discriminator_window_size", 16)
+        
+        # Flatten batch dimension and reshape
+        # obs_batch: [T, batch*agents, obs_dim]
+        T = obs_batch.shape[0] if len(obs_batch.shape) > 2 else 1
+        
+        # Debug: log shapes on first call
+        if self.n_opt_steps == 0:
+            Logger.warning(f"[Discriminator] obs_batch shape: {obs_batch.shape}, T={T}, window_size={window_size}")
+            Logger.warning(f"[Discriminator] strategy_code_batch shape: {strategy_code_batch.shape if strategy_code_batch is not None else 'None'}")
+        
+        if T < window_size:
+            # Not enough trajectory steps, skip discriminator update
+            if self.n_opt_steps == 0:
+                Logger.warning(f"[Discriminator] T={T} < window_size={window_size}, SKIPPING update!")
+            return None, None
+        
+        # For simplicity, use the last window_size steps
+        # In practice, you might want to sample multiple windows
+        if len(obs_batch.shape) == 3:
+            # [T, batch*agents, obs_dim]
+            batch_agents = obs_batch.shape[1]
+            batch_size = batch_agents // num_agents
+            
+            # Take last window_size steps
+            obs_window = obs_batch[-window_size:]  # [window, batch*agents, obs_dim]
+            action_window = actions_batch[-window_size:]  # [window, batch*agents]
+            
+            # Reshape to [batch, window, agents, dim]
+            obs_window = obs_window.permute(1, 0, 2)  # [batch*agents, window, obs_dim]
+            obs_window = obs_window.reshape(batch_size, num_agents, window_size, -1)
+            obs_window = obs_window.permute(0, 2, 1, 3)  # [batch, window, agents, obs_dim]
+            
+            action_window = action_window.permute(1, 0)  # [batch*agents, window]
+            action_window = action_window.reshape(batch_size, num_agents, window_size)
+            action_window = action_window.permute(0, 2, 1)  # [batch, window, agents]
+            
+            # Strategy code should be same for all agents, take first agent's
+            if len(strategy_code_batch.shape) == 2:
+                # [T, batch*agents]
+                strategy = strategy_code_batch[0].reshape(batch_size, num_agents)[:, 0]
+            else:
+                strategy = strategy_code_batch.reshape(-1, num_agents)[:, 0]
+        else:
+            # Fallback for different shapes
+            return None, None
+        
+        # Compute discriminator loss
+        loss, accuracy = self._policy.discriminator.compute_loss(
+            obs_window, action_window, strategy
+        )
+        
+        # Update discriminator
+        loss_scaled = loss / self.grad_accum_step
+        loss_scaled.backward()
+        
+        if self.n_opt_steps % self.grad_accum_step == 0:
+            if self._use_max_grad_norm:
+                torch.nn.utils.clip_grad_norm_(
+                    self._policy.discriminator.parameters(), self.max_grad_norm
+                )
+            self.discriminator_optimizer.step()
+            self.discriminator_optimizer.zero_grad()
+        
+        loss_val = float(loss.detach().cpu().numpy())
+        acc_val = float(accuracy.detach().cpu().numpy())
+        
+        # Log discriminator stats periodically
+        if self.n_opt_steps % 50 == 0:
+            Logger.info(f"[Discriminator] step={self.n_opt_steps}, loss={loss_val:.4f}, accuracy={acc_val:.4f}")
+        
+        return loss_val, acc_val
+    
+    def update_discriminator_with_trajectory(self, full_batch):
+        """
+        Update discriminator using the FULL trajectory batch (before mini-batching).
+        
+        This is called once per training epoch from the trainer, because:
+        - The discriminator needs temporal structure (window of consecutive steps)
+        - Mini-batching flattens/shuffles this structure
+        
+        Args:
+            full_batch: The complete trajectory batch with shape [T, batch, agents, dim]
+        
+        Returns:
+            dict with discriminator_loss and discriminator_accuracy, or empty dict
+        """
+        if self._policy.discriminator is None or self.discriminator_optimizer is None:
+            return {}
+        
+        strategy_code_batch = full_batch.get(EpisodeKey.STRATEGY_CODE, None)
+        if strategy_code_batch is None:
+            Logger.warning("[Discriminator] No STRATEGY_CODE in batch, skipping update")
+            return {}
+        
+        # Get observations and actions - keep trajectory structure!
+        # full_batch shape: [T+1, batch, agents, dim] 
+        obs_batch = full_batch[EpisodeKey.CUR_OBS]
+        actions_batch = full_batch[EpisodeKey.ACTION]
+        
+        if isinstance(obs_batch, np.ndarray):
+            obs_batch = torch.from_numpy(obs_batch).float().to(self._policy.device)
+        if isinstance(actions_batch, np.ndarray):
+            actions_batch = torch.from_numpy(actions_batch).long().to(self._policy.device)
+        if isinstance(strategy_code_batch, np.ndarray):
+            strategy_code_batch = torch.from_numpy(strategy_code_batch).long().to(self._policy.device)
+        
+        # Shape: [B, T+1, N, obs_dim] where B=batch, T+1=traj_length+1, N=num_agents
+        # This is the standard shape from return_compute
+        if len(obs_batch.shape) != 4:
+            Logger.warning(f"[Discriminator] Unexpected obs shape: {obs_batch.shape}")
+            return {}
+        
+        B, Tp1, N, obs_dim = obs_batch.shape
+        T = Tp1 - 1  # Actual trajectory length (last step is for bootstrapping)
+        batch_size = B
+        num_agents = N
+        
+        window_size = self._policy.custom_config.get("discriminator_window_size", 32)
+        
+        Logger.info(f"[Discriminator] Full batch shape: B={B}, T+1={Tp1}, agents={N}, obs_dim={obs_dim}")
+        
+        if T < window_size:
+            Logger.warning(f"[Discriminator] T={T} < window={window_size}, skipping. Consider reducing discriminator_window_size.")
+            return {}
+        
+        # Use last window_size steps (excluding bootstrap step)
+        # obs_batch: [B, T+1, N, obs_dim] -> take [:, T-window:T, :, :]
+        # Result: [B, window, N, obs_dim] which is already [batch, window, agents, obs_dim]
+        start_idx = T - window_size
+        obs_window = obs_batch[:, start_idx:T, :, :]  # [B, window, N, obs_dim]
+        action_window = actions_batch[:, start_idx:T, :]  # [B, window, N]
+        
+        # Strategy code: same for all timesteps, take from first step, first agent
+        # strategy shape: [B, T, N] or similar -> take [:, 0, 0] = [B]
+        if len(strategy_code_batch.shape) == 3:
+            strategy = strategy_code_batch[:, 0, 0]  # [B]
+        elif len(strategy_code_batch.shape) == 4:
+            strategy = strategy_code_batch[:, 0, 0, 0]  # [B]
+        else:
+            strategy = strategy_code_batch.flatten()[:batch_size]
+        
+        # Compute loss
+        loss, accuracy = self._policy.discriminator.compute_loss(
+            obs_window, action_window, strategy
+        )
+        
+        # Backward and update
+        self.discriminator_optimizer.zero_grad()
+        loss.backward()
+        
+        if self._use_max_grad_norm:
+            torch.nn.utils.clip_grad_norm_(
+                self._policy.discriminator.parameters(), self.max_grad_norm
+            )
+        self.discriminator_optimizer.step()
+        
+        loss_val = float(loss.detach().cpu().numpy())
+        acc_val = float(accuracy.detach().cpu().numpy())
+        
+        Logger.info(f"[Discriminator] UPDATED: loss={loss_val:.4f}, accuracy={acc_val:.4f}")
+        
+        return {
+            "discriminator_loss": loss_val,
+            "discriminator_accuracy": acc_val,
+        }
+    
+    def loss_compute_supervisor(self, sample):
+        """
+        Phase 2: Train supervisor via PPO while players are frozen.
+        
+        The supervisor selects strategy codes c_t = F_φ(s^global_t).
+        Players execute π(a|o, c_t) with frozen weights.
+        Supervisor is trained on team reward.
+        """
+        if self._policy.supervisor is None:
+            Logger.warning("Phase 2 training requested but supervisor is None")
+            return {}
+        
+        # Ensure players are frozen
+        if not self._policy._players_frozen:
+            self._policy.freeze_players()
+        
+        # Extract supervisor-specific data from sample
+        # We need: global observations, supervisor actions, returns, advantages
+        obs_batch = sample[EpisodeKey.CUR_OBS]
+        supervisor_action_batch = sample.get(EpisodeKey.SUPERVISOR_ACTION, sample.get(EpisodeKey.STRATEGY_CODE))
+        old_log_prob_batch = sample.get(EpisodeKey.SUPERVISOR_LOG_PROB)
+        value_preds_batch = sample.get(EpisodeKey.SUPERVISOR_VALUE, sample.get(EpisodeKey.STATE_VALUE))
+        return_batch = sample[EpisodeKey.RETURN]
+        adv_targ = sample[EpisodeKey.ADVANTAGE]
+        active_masks_batch = sample.get(EpisodeKey.ACTIVE_MASK, None)
+        
+        if supervisor_action_batch is None or old_log_prob_batch is None:
+            Logger.warning("Missing supervisor data in sample for Phase 2 training")
+            return {}
+        
+        # Convert to tensors
+        if isinstance(supervisor_action_batch, np.ndarray):
+            supervisor_action_batch = torch.from_numpy(supervisor_action_batch).long().to(self._policy.device)
+        if isinstance(old_log_prob_batch, np.ndarray):
+            old_log_prob_batch = torch.from_numpy(old_log_prob_batch).float().to(self._policy.device)
+        if isinstance(value_preds_batch, np.ndarray):
+            value_preds_batch = torch.from_numpy(value_preds_batch).float().to(self._policy.device)
+        if isinstance(return_batch, np.ndarray):
+            return_batch = torch.from_numpy(return_batch).float().to(self._policy.device)
+        if isinstance(adv_targ, np.ndarray):
+            adv_targ = torch.from_numpy(adv_targ).float().to(self._policy.device)
+        if active_masks_batch is not None and isinstance(active_masks_batch, np.ndarray):
+            active_masks_batch = torch.from_numpy(active_masks_batch).float().to(self._policy.device)
+        if isinstance(obs_batch, np.ndarray):
+            obs_batch = torch.from_numpy(obs_batch).float().to(self._policy.device)
+        
+        # Pool observations to get global state for supervisor
+        # obs_batch shape: [T, batch*agents, obs_dim] or [batch*agents, obs_dim]
+        num_agents = self._policy.custom_config.get("num_agents", 4)
+        if obs_batch.dim() == 3:
+            # [T, batch*agents, obs_dim] -> pool across agents
+            T, batch_agents, obs_dim = obs_batch.shape
+            batch_size = batch_agents // num_agents
+            obs_pooled = obs_batch.view(T, batch_size, num_agents, obs_dim).mean(dim=2)  # [T, batch, obs_dim]
+            obs_pooled = obs_pooled.view(-1, obs_dim)  # [T*batch, obs_dim]
+        else:
+            # [batch*agents, obs_dim]
+            batch_agents, obs_dim = obs_batch.shape
+            batch_size = batch_agents // num_agents
+            obs_pooled = obs_batch.view(batch_size, num_agents, obs_dim).mean(dim=1)  # [batch, obs_dim]
+        
+        # Get supervisor action shape right (take first agent's strategy, same for all)
+        if supervisor_action_batch.dim() > 1:
+            # Take strategy from first agent only
+            supervisor_action_batch = supervisor_action_batch.reshape(-1, num_agents)[..., 0]
+        if old_log_prob_batch.dim() > 1:
+            old_log_prob_batch = old_log_prob_batch.reshape(-1, num_agents)[..., 0]
+        
+        # Forward pass through supervisor
+        _, new_log_prob, values, entropy = self._policy.supervisor(
+            obs_pooled,
+            explore=False,
+            strategy=supervisor_action_batch.flatten()
+        )
+        
+        # Compute PPO loss for supervisor
+        log_prob = new_log_prob.view(-1, 1)
+        old_log_prob = old_log_prob_batch.view(-1, 1)
+        
+        # Importance weights
+        imp_weights = torch.exp(log_prob - old_log_prob)
+        
+        # Aggregate advantages across agents (same strategy for all)
+        if adv_targ.dim() > 1 and adv_targ.shape[-1] > 1:
+            adv_targ_sup = adv_targ.view(-1, num_agents, 1).mean(dim=1)  # Average across agents
+        else:
+            adv_targ_sup = adv_targ.view(-1, 1)[:obs_pooled.shape[0]]
+        
+        # Clipped surrogate objective
+        surr1 = imp_weights * adv_targ_sup
+        surr2 = torch.clamp(imp_weights, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv_targ_sup
+        policy_loss = -torch.min(surr1, surr2).mean()
+        
+        # Entropy bonus
+        if entropy is not None:
+            entropy_loss = -entropy.mean()
+        else:
+            entropy_loss = torch.tensor(0.0)
+        
+        # Value loss
+        if return_batch.dim() > 1 and return_batch.shape[-1] > 1:
+            return_sup = return_batch.view(-1, num_agents, 1).mean(dim=1)
+        else:
+            return_sup = return_batch.view(-1, 1)[:obs_pooled.shape[0]]
+        
+        if value_preds_batch.dim() > 1 and value_preds_batch.shape[-1] > 1:
+            value_preds_sup = value_preds_batch.view(-1, num_agents, 1).mean(dim=1)
+        else:
+            value_preds_sup = value_preds_batch.view(-1, 1)[:obs_pooled.shape[0]]
+        
+        value_loss = self._calc_value_loss(values, value_preds_sup, return_sup)
+        
+        # Total loss
+        entropy_coef = self._policy.custom_config.get("entropy_coef", 0.01)
+        value_loss_coef = self._policy.custom_config.get("value_loss_coef", 1.0)
+        
+        total_loss = policy_loss + entropy_loss * entropy_coef + value_loss * value_loss_coef
+        total_loss = total_loss / self.grad_accum_step
+        
+        # Backward and update
+        total_loss.backward()
+        
+        if self.n_opt_steps % self.grad_accum_step == 0:
+            if self._use_max_grad_norm:
+                torch.nn.utils.clip_grad_norm_(
+                    self._policy.supervisor.parameters(), self.max_grad_norm
+                )
+            self.supervisor_optimizer.step()
+            self.supervisor_optimizer.zero_grad()
+        
+        # Statistics
+        stats = {
+            "supervisor_policy_loss": float(policy_loss.detach().cpu().numpy()),
+            "supervisor_value_loss": float(value_loss.detach().cpu().numpy()),
+            "supervisor_entropy": float(entropy.mean().detach().cpu().numpy()) if entropy is not None else 0.0,
+            "supervisor_ratio": float(imp_weights.mean().detach().cpu().numpy()),
+        }
+        
         return stats
     
     def loss_compute_sequential(self, sample):

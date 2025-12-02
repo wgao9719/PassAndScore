@@ -132,6 +132,10 @@ class MAPPO(Policy):
         custom_config.setdefault("device", str(resolved_device))
         # self.env_agent_id = kwargs["env_agent_id"]
         
+        # Strategy conditioning configuration (Phase 1 pre-training)
+        self.use_strategy_conditioning = custom_config.get("use_strategy_conditioning", False)
+        self.num_strategies = int(custom_config.get("num_strategies", 8))
+        
         # TODO(jh): retrieve from feature encoder as well.
         # TODO(jh): this is not true in most cases, may be removed later.
         global_observation_space = observation_space
@@ -179,6 +183,52 @@ class MAPPO(Policy):
                 self.custom_config,
                 self.model_config["initialization"],
             )
+        
+        # Strategy discriminator for Phase 1 pre-training
+        # Predicts strategy code c from trajectory -> enables intrinsic reward
+        if self.use_strategy_conditioning and hasattr(model, "StrategyDiscriminator"):
+            obs_dim = observation_space.shape[0] if hasattr(observation_space, 'shape') else 115
+            self.discriminator = model.StrategyDiscriminator(
+                obs_dim=obs_dim,
+                num_strategies=self.num_strategies,
+                hidden_dim=custom_config.get("discriminator_hidden_dim", 64),
+                window_size=custom_config.get("discriminator_window_size", 16),
+                num_agents=custom_config.get("num_agents", 4),
+                use_actions=custom_config.get("discriminator_use_actions", True),
+                action_dim=19,  # GRF action space
+            )
+            Logger.warning(f"[Phase 1] Created StrategyDiscriminator with {self.num_strategies} strategies")
+        else:
+            self.discriminator = None
+            if self.use_strategy_conditioning:
+                Logger.warning(f"[Phase 1] use_strategy_conditioning=True but StrategyDiscriminator not found in model! hasattr={hasattr(model, 'StrategyDiscriminator')}")
+        
+        # ========== Phase 2: Supervisor for strategy selection ==========
+        # Training mode: "phase1" = train players with random c
+        #                "phase2" = freeze players, train supervisor
+        #                "normal" = regular MAPPO (no strategy conditioning)
+        self.training_phase = custom_config.get("training_phase", "normal")
+        self.use_supervisor = custom_config.get("use_supervisor", False)
+        
+        if self.use_supervisor and hasattr(model, "Supervisor"):
+            obs_dim = observation_space.shape[0] if hasattr(observation_space, 'shape') else 115
+            self.supervisor = model.Supervisor(
+                obs_dim=obs_dim,
+                num_strategies=self.num_strategies,
+                hidden_dim=custom_config.get("supervisor_hidden_dim", 128),
+                num_agents=custom_config.get("num_agents", 4),
+                # God-View Transformer architecture
+                entity_dim=custom_config.get("supervisor_entity_dim", 6),
+                num_entities=custom_config.get("supervisor_num_entities", 23),
+                num_heads=custom_config.get("supervisor_num_heads", 4),
+                num_layers=custom_config.get("supervisor_num_layers", 2),
+                use_transformer=custom_config.get("supervisor_use_transformer", True),
+            )
+        else:
+            self.supervisor = None
+        
+        # Track frozen state for Phase 2
+        self._players_frozen = False
 
         self.observation_space = observation_space
         self.action_space = action_space
@@ -190,7 +240,7 @@ class MAPPO(Policy):
 
     def get_initial_state(self, batch_size) -> List[DataTransferType]:
         # TODO(jh): try to remove dependcies on rnn_layer_num & rnn_state_size
-        return {
+        states = {
             EpisodeKey.ACTOR_RNN_STATE: np.zeros(
                 (batch_size, self.actor.rnn_layer_num, self.actor.rnn_state_size)
             ),
@@ -198,6 +248,79 @@ class MAPPO(Policy):
                 (batch_size, self.critic.rnn_layer_num, self.critic.rnn_state_size)
             ),
         }
+        if self.supervisor is not None:
+            states[EpisodeKey.SUPERVISOR_RNN_STATE] = np.zeros(
+                (batch_size, self.supervisor.rnn_layer_num, self.supervisor.rnn_state_size)
+            )
+        return states
+    
+    def freeze_players(self):
+        """Freeze player networks for Phase 2 training (supervisor only)."""
+        self._players_frozen = True
+        for param in self.actor.parameters():
+            param.requires_grad = False
+        for param in self.critic.parameters():
+            param.requires_grad = False
+        if self.share_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+        if self.discriminator is not None:
+            for param in self.discriminator.parameters():
+                param.requires_grad = False
+        Logger.info("Players frozen for Phase 2 training")
+    
+    def unfreeze_players(self):
+        """Unfreeze player networks."""
+        self._players_frozen = False
+        for param in self.actor.parameters():
+            param.requires_grad = True
+        for param in self.critic.parameters():
+            param.requires_grad = True
+        if self.share_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = True
+        if self.discriminator is not None:
+            for param in self.discriminator.parameters():
+                param.requires_grad = True
+        Logger.info("Players unfrozen")
+    
+    def compute_supervisor_action(self, global_obs, explore=True, strategy=None, to_numpy=False):
+        """
+        Compute supervisor action (strategy selection) for Phase 2.
+        
+        Args:
+            global_obs: Pooled global observation [batch, obs_dim]
+            explore: Whether to sample or take argmax
+            strategy: Optional, for computing log_prob of given strategy
+            to_numpy: Whether to convert outputs to numpy
+        
+        Returns:
+            dict with strategy, log_prob, value, entropy
+        """
+        if self.supervisor is None:
+            raise ValueError("Supervisor not initialized. Set use_supervisor=True")
+        
+        if isinstance(global_obs, np.ndarray):
+            global_obs = torch.from_numpy(global_obs).float().to(self.device)
+        
+        with torch.set_grad_enabled(not to_numpy):
+            strategy_out, log_prob, value, entropy = self.supervisor(
+                global_obs, explore=explore, strategy=strategy
+            )
+        
+        ret = {
+            EpisodeKey.SUPERVISOR_ACTION: strategy_out,
+            EpisodeKey.SUPERVISOR_LOG_PROB: log_prob,
+            EpisodeKey.SUPERVISOR_VALUE: value,
+        }
+        if entropy is not None:
+            ret[EpisodeKey.ACTION_ENTROPY] = entropy
+        
+        if to_numpy:
+            ret = {k: v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v 
+                   for k, v in ret.items()}
+        
+        return ret
 
     def to_device(self, device):
         self_copy = copy.deepcopy(self)
@@ -206,6 +329,10 @@ class MAPPO(Policy):
         self_copy.critic = self_copy.critic.to(device)
         if self.share_backbone:
             self_copy.backbone = self_copy.backbone.to(device)
+        if self.discriminator is not None:
+            self_copy.discriminator = self_copy.discriminator.to(device)
+        if self.supervisor is not None:
+            self_copy.supervisor = self_copy.supervisor.to(device)
         if self.custom_config["use_popart"]:
             self_copy.value_normalizer = self_copy.value_normalizer.to(device)
             self_copy.value_normalizer.tpdv = dict(dtype=torch.float32, device=device)
@@ -262,10 +389,19 @@ class MAPPO(Policy):
                 flash_token = kwargs[EpisodeKey.FLASH_TOKEN]
                 if flash_token is not None:
                     observations["flash_token"] = flash_token
-
-            actions, actor_rnn_states, action_log_probs, dist_entropy = self.actor(
-                observations, actor_rnn_states, rnn_masks, action_masks, explore, actions
-            )
+            
+            # Get strategy code for FiLM conditioning (Phase 1 pre-training)
+            # Only pass strategy_code if the actor supports it
+            if self.use_strategy_conditioning and hasattr(self.actor, 'use_strategy_conditioning'):
+                strategy_code = kwargs.get(EpisodeKey.STRATEGY_CODE, None)
+                actions, actor_rnn_states, action_log_probs, dist_entropy = self.actor(
+                    observations, actor_rnn_states, rnn_masks, action_masks, explore, actions,
+                    strategy_code=strategy_code
+                )
+            else:
+                actions, actor_rnn_states, action_log_probs, dist_entropy = self.actor(
+                    observations, actor_rnn_states, rnn_masks, action_masks, explore, actions
+                )
             
             # TODO(jh): add to_numpy
             if to_numpy:
@@ -355,6 +491,10 @@ class MAPPO(Policy):
             self.value_normalizer.train()
         if self.share_backbone:
             self.backbone.train()
+        if self.discriminator is not None:
+            self.discriminator.train()
+        if self.supervisor is not None:
+            self.supervisor.train()
 
     def eval(self):
         self.actor.eval()
@@ -363,13 +503,23 @@ class MAPPO(Policy):
             self.value_normalizer.eval()
         if self.share_backbone:
             self.backbone.eval()
+        if self.discriminator is not None:
+            self.discriminator.eval()
+        if self.supervisor is not None:
+            self.supervisor.eval()
 
     def dump(self, dump_dir):
         os.makedirs(dump_dir, exist_ok=True)
-        torch.save(self.actor, os.path.join(dump_dir, "actor.pt"))
-        torch.save(self.critic, os.path.join(dump_dir, "critic.pt"))
+        # Save state_dict instead of entire model to avoid pickling issues
+        # with classes defined in __init__.py
+        torch.save(self.actor.state_dict(), os.path.join(dump_dir, "actor.pt"))
+        torch.save(self.critic.state_dict(), os.path.join(dump_dir, "critic.pt"))
         if self.share_backbone:
-            torch.save(self.backbone, os.path.join(dump_dir, "backbone.pt"))
+            torch.save(self.backbone.state_dict(), os.path.join(dump_dir, "backbone.pt"))
+        if self.discriminator is not None:
+            torch.save(self.discriminator.state_dict(), os.path.join(dump_dir, "discriminator.pt"))
+        if self.supervisor is not None:
+            torch.save(self.supervisor.state_dict(), os.path.join(dump_dir, "supervisor.pt"))
         pickle.dump(self.description, open(os.path.join(dump_dir, "desc.pkl"), "wb"))
 
     @staticmethod
@@ -386,20 +536,33 @@ class MAPPO(Policy):
             **kwargs,
         )
 
+        # Load state_dict (we now save state_dict instead of entire model)
         actor_path = os.path.join(dump_dir, "actor.pt")
         if os.path.exists(actor_path):
-            actor = torch.load(actor_path, res.device)
-            hard_update(res.actor, actor)
+            state_dict = torch.load(actor_path, map_location=res.device)
+            res.actor.load_state_dict(state_dict)
             
         critic_path = os.path.join(dump_dir, "critic.pt")
         if os.path.exists(critic_path):
-            critic = torch.load(critic_path, res.device)
-            hard_update(res.critic, critic)
+            state_dict = torch.load(critic_path, map_location=res.device)
+            res.critic.load_state_dict(state_dict)
         
         if res.share_backbone:
             backbone_path = os.path.join(dump_dir, "backbone.pt")
             if os.path.exists(backbone_path):
-                backbone = torch.load(backbone_path, res.device)
-                hard_update(res.backbone, backbone)
+                state_dict = torch.load(backbone_path, map_location=res.device)
+                res.backbone.load_state_dict(state_dict)
+        
+        if res.discriminator is not None:
+            discriminator_path = os.path.join(dump_dir, "discriminator.pt")
+            if os.path.exists(discriminator_path):
+                state_dict = torch.load(discriminator_path, map_location=res.device)
+                res.discriminator.load_state_dict(state_dict)
+        
+        if res.supervisor is not None:
+            supervisor_path = os.path.join(dump_dir, "supervisor.pt")
+            if os.path.exists(supervisor_path):
+                state_dict = torch.load(supervisor_path, map_location=res.device)
+                res.supervisor.load_state_dict(state_dict)
                 
         return res

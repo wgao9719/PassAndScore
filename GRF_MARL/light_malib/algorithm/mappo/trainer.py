@@ -93,6 +93,13 @@ class MAPPOTrainer(Trainer):
 
             total_opt_result["kl_diff"] = kl_diff
             total_opt_result["training_epoch"] = i_epoch + 1
+            
+            # Update discriminator once per epoch with FULL trajectory (not mini-batched)
+            # The discriminator needs temporal structure which is lost in mini-batching
+            if i_epoch == 0:  # Only once per optimize call
+                disc_result = self.loss.update_discriminator_with_trajectory(batch_with_return)
+                if disc_result:
+                    total_opt_result.update(disc_result)
 
         # TODO(ziyu & ming): find a way for customize optimizer and scheduler
         # but now it doesn't affect the performance ...

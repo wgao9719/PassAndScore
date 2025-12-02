@@ -43,6 +43,22 @@ class EpisodeKey:
     GLOBAL_STATE = "global_state"
     NEXT_GLOBAL_STATE = 'next_global_state'
     FLASH_TOKEN = "flash_token"
+    
+    # Strategy conditioning (Phase 1 pre-training)
+    STRATEGY_CODE = "strategy_code"           # Categorical strategy index [0, K)
+    STRATEGY_LOGPROB = "strategy_logprob"     # Discriminator log p(c|trajectory)
+    INTRINSIC_REWARD = "intrinsic_reward"     # r_intrinsic = log q(c|s_{t-k:t})
+    
+    # Supervisor (Phase 2 training)
+    SUPERVISOR_ACTION = "supervisor_action"   # Strategy selected by supervisor
+    SUPERVISOR_LOG_PROB = "supervisor_log_prob"
+    SUPERVISOR_VALUE = "supervisor_value"
+    SUPERVISOR_RNN_STATE = "supervisor_rnn_state"
+    
+    # Dense tactical rewards for Supervisor (prevents posterior collapse)
+    SUPERVISOR_REWARD = "supervisor_reward"   # Combined tactical reward
+    BALL_PROGRESSION = "ball_progression"     # Did ball move toward enemy goal?
+    POSSESSION_REWARD = "possession_reward"   # Did we keep the ball?
 
     # post process
     ACC_REWARD = "accumulate_reward"

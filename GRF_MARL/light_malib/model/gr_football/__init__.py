@@ -80,5 +80,10 @@ sys.modules["light_malib.model.gr_football.passandscore_factorized"]=ModelWrappe
     passandscore_factorized.Actor,
     passandscore_factorized.Critic,
     passandscore_factorized.FeatureEncoder,
-    Backbone=passandscore_factorized.Backbone
+    Backbone=passandscore_factorized.Backbone,
+    # Phase 1 & 2: Strategy conditioning components
+    FiLMGenerator=passandscore_factorized.FiLMGenerator,
+    StrategyDiscriminator=passandscore_factorized.StrategyDiscriminator,
+    TransformerEncoder=passandscore_factorized.TransformerEncoder,
+    Supervisor=passandscore_factorized.Supervisor,
 )

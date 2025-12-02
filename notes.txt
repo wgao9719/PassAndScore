@@ -8,4 +8,10 @@ python3 -m light_malib.main_pbt --config expr_configs/cooperative_MARL_benchmark
 2. CTDE (IPPO): 
 python3 -m light_malib.main_pbt --config expr_configs/cooperative_MARL_benchmark/full_game/5_vs_5_hard/ippo.yaml
 
+
+python -m light_malib.main_pbt --config expr_configs/cooperative_MARL_benchmark/full_game/5_vs_5_hard/mappo_phase1.yaml
+
+python -m light_malib.main_pbt --config expr_configs/cooperative_MARL_benchmark/full_game/5_vs_5_hard/mappo_phase2.yaml
+
+
 tensorboard --logdir logs/

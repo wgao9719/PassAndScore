@@ -20,6 +20,25 @@ from light_malib.utils.logger import Logger
 
 
 def compute_return(policy, batch):
+    # Phase 2: Use dense tactical rewards for supervisor instead of sparse game rewards
+    # This prevents posterior collapse from reward sparsity
+    training_phase = policy.custom_config.get("training_phase", "normal")
+    if training_phase == "phase2" and EpisodeKey.SUPERVISOR_REWARD in batch:
+        # Swap rewards for supervisor training
+        original_reward = batch[EpisodeKey.REWARD]
+        supervisor_reward = batch[EpisodeKey.SUPERVISOR_REWARD]
+        
+        # Convert supervisor_reward to same shape as original_reward
+        if hasattr(supervisor_reward, 'shape'):
+            if len(supervisor_reward.shape) < len(original_reward.shape):
+                # Expand to match: [T, batch, agents, 1]
+                while len(supervisor_reward.shape) < len(original_reward.shape):
+                    supervisor_reward = np.expand_dims(supervisor_reward, axis=-1)
+                supervisor_reward = np.broadcast_to(supervisor_reward, original_reward.shape)
+        
+        batch[EpisodeKey.REWARD] = supervisor_reward
+        Logger.debug("Phase 2: Using SUPERVISOR_REWARD for return computation")
+    
     return_mode = policy.custom_config["return_mode"]
     if return_mode == "gae":
         return compute_new_gae(policy,batch,use_old_V=True)

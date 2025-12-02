@@ -49,6 +49,7 @@ class RolloutWorker:
 
         self.credit_reassign_cfg = self.cfg.credit_reassign
         self.flash_cfg = getattr(self.cfg, "flash_token", None)
+        self.strategy_cfg = getattr(self.cfg, "strategy_conditioning", None)
         
         torch.set_num_threads(1)
 
