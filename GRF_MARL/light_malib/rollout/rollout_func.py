@@ -133,10 +133,9 @@ class TacticalRewardComputer:
                 EpisodeKey.POSSESSION_REWARD: 0.0,
             }
         
-        # Extract ball x position from observation
-        # GRF observation layout varies, but ball is typically around index 88-89
-        # Adjust indices based on your feature encoder
-        ball_x = self._extract_ball_x(obs)
+        # Extract ball x position from info dict (preferred) or observation
+        # Using info dict is more reliable as obs indices differ between representations
+        ball_x = self._extract_ball_x(obs, info)
         
         # Ball progression: positive if ball moved toward enemy goal
         if self.prev_ball_x is not None and ball_x is not None:
@@ -164,46 +163,81 @@ class TacticalRewardComputer:
             EpisodeKey.POSSESSION_REWARD: float(possession),
         }
     
-    def _extract_ball_x(self, obs):
-        """Extract ball x position from observation."""
+    def _extract_ball_x(self, obs, info=None):
+        """Extract ball x position from observation or info dict.
+        
+        IMPORTANT: Using info dict is more reliable than observation indices,
+        as observation indices differ between 'raw' and 'simple115' representations.
+        """
+        # Option 1: From info dict (reliable across all representations)
+        if info is not None:
+            if isinstance(info, dict):
+                # GRF info dict contains 'ball' as [x, y, z]
+                if 'ball' in info:
+                    ball = info['ball']
+                    if hasattr(ball, '__len__') and len(ball) > 0:
+                        return float(ball[0])  # x coordinate
+            elif isinstance(info, (list, tuple)) and len(info) > 0:
+                # Sometimes info is a list of dicts per agent
+                first_info = info[0] if isinstance(info[0], dict) else {}
+                if 'ball' in first_info:
+                    ball = first_info['ball']
+                    if hasattr(ball, '__len__') and len(ball) > 0:
+                        return float(ball[0])
+        
+        # Option 2: Fallback to observation (less reliable)
         if obs is None:
             return None
         
-        # Handle different observation shapes
         if isinstance(obs, dict):
-            # Get from first agent
             obs = next(iter(obs.values()))
         
         if hasattr(obs, 'shape'):
-            # Flatten if needed
             if obs.ndim > 1:
                 obs = obs.flatten()
             
-            # Ball x is typically at index 88 in GRF simple115 representation
-            # Adjust this index based on your actual feature encoder
+            # WARNING: Index 88 is only valid for simple115 representation!
+            # For 'raw' representation, this will return garbage.
+            # Only use if info dict unavailable.
             if len(obs) > 88:
                 return float(obs[88])
         
         return None
     
     def _extract_possession(self, obs, info=None):
-        """Extract possession from observation or info."""
-        # Option 1: From info dict (if available)
-        if info is not None:
-            if isinstance(info, dict):
-                if 'ball_owned_team' in info:
-                    return 1.0 if info['ball_owned_team'] == 0 else 0.0  # 0 = left team
+        """Extract possession from observation or info.
         
-        # Option 2: Infer from observation
-        # In GRF, ball_owned_team might be encoded in the observation
-        # This is a heuristic - adjust based on your feature encoder
+        IMPORTANT: Using info dict is more reliable than observation indices,
+        as observation indices differ between 'raw' and 'simple115' representations.
+        """
+        # Option 1: From info dict (reliable across all representations)
+        if info is not None:
+            ball_owned_team = None
+            
+            if isinstance(info, dict):
+                ball_owned_team = info.get('ball_owned_team')
+            elif isinstance(info, (list, tuple)) and len(info) > 0:
+                # Sometimes info is a list of dicts per agent
+                first_info = info[0] if isinstance(info[0], dict) else {}
+                ball_owned_team = first_info.get('ball_owned_team')
+            
+            if ball_owned_team is not None:
+                # 0 = left team (us), 1 = right team (opponent), -1 = no one
+                if ball_owned_team == 0:
+                    return 1.0  # We have the ball
+                elif ball_owned_team == 1:
+                    return -0.5  # Opponent has ball (mild negative)
+                else:
+                    return 0.0  # Neutral (ball in air, etc.)
+        
+        # Option 2: Fallback to observation (less reliable)
+        # WARNING: Index 91 is only valid for simple115 representation!
         if obs is not None:
             if isinstance(obs, dict):
                 obs = next(iter(obs.values()))
             if hasattr(obs, 'shape') and obs.ndim > 1:
                 obs = obs.flatten()
             
-            # Ball ownership might be around index 91 in simple115
             if len(obs) > 91:
                 ownership = obs[91]
                 if ownership > 0.5:  # Left team has ball
@@ -826,12 +860,14 @@ def rollout_func(
             else:
                 game_reward = float(game_reward)
             
-            # Get observation for tactical reward computation
+            # Get observation and info for tactical reward computation
             obs_for_tactical = policy_inputs.get(first_agent, {}).get(EpisodeKey.CUR_OBS)
+            info_for_tactical = env_rets[first_agent].get(EpisodeKey.INFO)
             
             tactical_rewards = tactical_reward_computer.compute(
                 obs=obs_for_tactical,
                 reward=game_reward,
+                info=info_for_tactical,
             )
             
             # Attach supervisor reward to step data for Phase 2 training

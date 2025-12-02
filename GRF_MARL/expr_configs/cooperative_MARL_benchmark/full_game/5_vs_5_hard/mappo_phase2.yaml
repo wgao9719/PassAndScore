@@ -125,13 +125,13 @@ rollout_manager:
       # Temporal abstraction: supervisor acts every K steps
       # Prevents "jitter" - gives strategies time to manifest
       # 50 steps = ~3-5 seconds in GRF at 10Hz
-      supervisor_interval: 50
+      supervisor_interval: 30
       # Dense tactical rewards for supervisor (prevents posterior collapse)
       tactical_rewards:
         enabled: True
-        goal_coef: 2.0              # Weight for goal/score rewards
-        progression_coef: 0.05       # Weight for ball moving toward enemy goal
-        possession_coef: 0.025       # Weight for keeping the ball
+        goal_coef: 1.0              # Weight for goal/score rewards
+        progression_coef: 0.1       # Weight for ball moving toward enemy goal
+        possession_coef: 0.005       # Weight for keeping the ball
     rollout_func_name: "rollout_func"
     episode_mode: 'traj'
     envs:
@@ -151,7 +151,7 @@ rollout_manager:
           other_config_options:
             action_set: v2
         reward_config:
-          goal_reward: 5.0
+          goal_reward: 1.0
           official_reward: 1
     credit_reassign:
     decaying_exploration:

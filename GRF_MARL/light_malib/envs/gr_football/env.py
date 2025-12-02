@@ -215,7 +215,8 @@ class GRFootballEnv(BaseEnv):
                 EpisodeKey.ACTION_MASK: action_masks[agent_id],
                 EpisodeKey.REWARD: rewards[agent_id],
                 EpisodeKey.DONE: dones[agent_id],
-                EpisodeKey.GLOBAL_STATE: team_state[agent_id][np.newaxis,...]
+                EpisodeKey.GLOBAL_STATE: team_state[agent_id][np.newaxis,...],
+                EpisodeKey.INFO: info,
             }
             for agent_id in self.agent_ids
         }

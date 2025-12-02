@@ -15,3 +15,13 @@ python -m light_malib.main_pbt --config expr_configs/cooperative_MARL_benchmark/
 
 
 tensorboard --logdir logs/
+
+
+Heatmap
+cd GRF_MARL
+python -m test_scripts.test_strategy_diversity --checkpoint /Users/willi1/multi-agent-rl/PassAndScore/GRF_MARL/logs/gr_football/full_game_5_vs_5_hard_mappo_phase1/2025-12-02-02-08-09/agent_0/agent_0-default-1/epoch_300
+
+cd GRF_MARL
+python -m test_scripts.visualize_strategies --checkpoint /Users/willi1/multi-agent-rl/PassAndScore/GRF_MARL/logs/gr_football/full_game_5_vs_5_hard_mappo_phase1/2025-12-02-02-08-09/agent_0/agent_0-default-1/epoch_300 --episodes 5 --max_steps 1000
+
+python -m test_scripts.analyze_behavior --checkpoint ./logs/gr_football/full_game_5_vs_5_hard_mappo_phase1/2025-12-02-02-08-09/agent_0/agent_0-default-1/epoch_300 --episodes 3 --max_steps 500
