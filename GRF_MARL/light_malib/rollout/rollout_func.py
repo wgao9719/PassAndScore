@@ -20,6 +20,64 @@ from light_malib.envs.base_env import BaseEnv
 from light_malib.utils.desc.task_desc import RolloutDesc
 from light_malib.utils.timer import global_timer
 from light_malib.utils.naming import default_table_name
+from light_malib.utils.episode import EpisodeKey
+
+
+class FlashTokenManager:
+    def __init__(self, cfg, env):
+        self.cfg = cfg or {}
+        self.enabled = bool(self.cfg.get("enabled", False))
+        self.dim = int(self.cfg.get("dim", 0))
+        if self.dim <= 0:
+            self.enabled = False
+        self.mode = str(self.cfg.get("mode", "off")).lower()
+        self.std = float(self.cfg.get("std", 1.0))
+        self.rng = np.random.default_rng(self.cfg.get("seed", None))
+        self.num_players = getattr(env, "num_players", {})
+        self.current = {}
+        self.episode_base = None
+
+    def _zeros(self):
+        tokens = {}
+        for agent_id, n in self.num_players.items():
+            tokens[agent_id] = np.zeros((n, self.dim), dtype=np.float32) if self.dim > 0 else None
+        return tokens
+
+    def _sample_vector(self):
+        return self.rng.normal(0.0, self.std, size=(1, self.dim)).astype(np.float32)
+
+    def reset(self):
+        self.episode_base = None
+        if self.mode == "gaussian_episode" and self.enabled:
+            self.episode_base = {
+                agent_id: self._sample_vector() for agent_id in self.num_players
+            }
+        self.current = self._zeros() if not self.enabled else {}
+
+    def sample(self):
+        if not self.enabled:
+            if not self.current:
+                self.current = self._zeros()
+            return self.current
+
+        tokens = {}
+        for agent_id, n in self.num_players.items():
+            if self.mode == "gaussian_episode":
+                base = self.episode_base[agent_id]
+            else:  # gaussian_step or default
+                base = self._sample_vector()
+            tokens[agent_id] = np.repeat(base, n, axis=0)
+        self.current = tokens
+        return tokens
+
+    def attach(self, step_data):
+        tokens = self.sample()
+        for agent_id, token in tokens.items():
+            if token is None:
+                step_data[agent_id].pop(EpisodeKey.FLASH_TOKEN, None)
+            else:
+                step_data[agent_id][EpisodeKey.FLASH_TOKEN] = token
+        return step_data
 
 
 def rename_fields(data, fields, new_fields):
@@ -126,6 +184,7 @@ def submit_traj(data_server,step_data_list,last_step_data,rollout_desc,s_idx=Non
             EpisodeKey.DONE,
             EpisodeKey.CRITIC_RNN_STATE,
             EpisodeKey.NEXT_STATE,
+            EpisodeKey.FLASH_TOKEN,
         ],
     )
     bootstrap_data = rename_fields(bootstrap_data, [EpisodeKey.NEXT_OBS,EpisodeKey.NEXT_STATE], [EpisodeKey.CUR_OBS,EpisodeKey.CUR_OBS])
@@ -182,7 +241,8 @@ def submit_batches(data_server,episode, rollout_desc,credit_reassign_cfg=None,as
             EpisodeKey.CRITIC_RNN_STATE: episode[step][EpisodeKey.CRITIC_RNN_STATE],
             EpisodeKey.NEXT_CRITIC_RNN_STATE: episode[step + 1][EpisodeKey.CRITIC_RNN_STATE],
             EpisodeKey.GLOBAL_STATE: episode[step][EpisodeKey.GLOBAL_STATE],
-            EpisodeKey.NEXT_GLOBAL_STATE: episode[step + 1][EpisodeKey.GLOBAL_STATE]
+            EpisodeKey.NEXT_GLOBAL_STATE: episode[step + 1][EpisodeKey.GLOBAL_STATE],
+            EpisodeKey.FLASH_TOKEN: episode[step].get(EpisodeKey.FLASH_TOKEN),
         }
         transitions.append(transition)
     if hasattr(data_server.save, 'remote'):
@@ -254,13 +314,20 @@ def rollout_func(
 
     step_data = env_reset(env,behavior_policies,custom_reset_config)
 
+    flash_manager = FlashTokenManager(getattr(rollout_worker, "flash_cfg", None), env)
+    flash_manager.reset()
+
     step = 0
     step_data_list = []
     results = []
     # collect until rollout_length
     while step <= rollout_length:
+        step_data = flash_manager.attach(step_data)
         # prepare policy input
         policy_inputs = rename_fields(step_data, [EpisodeKey.NEXT_OBS,EpisodeKey.NEXT_STATE], [EpisodeKey.CUR_OBS,EpisodeKey.CUR_OBS])
+        for agent_id in policy_inputs:
+            if EpisodeKey.FLASH_TOKEN in step_data[agent_id]:
+                policy_inputs[agent_id][EpisodeKey.FLASH_TOKEN] = step_data[agent_id][EpisodeKey.FLASH_TOKEN]
         policy_outputs = {}
         global_timer.record("inference_start")
         for agent_id, (policy_id, policy) in behavior_policies.items():
@@ -378,6 +445,7 @@ def rollout_func(
             
             # reset env
             step_data = env_reset(env,behavior_policies,custom_reset_config)
+            flash_manager.reset()
     
     if not eval and sample_length <= 0:            #collect after rollout done
         # used for the academy
@@ -390,4 +458,3 @@ def rollout_func(
 
     results={"results":results}            
     return results
-

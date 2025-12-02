@@ -65,6 +65,33 @@ python3 light_malib/main_pbt.py --config PATH_TO_CONFIG
 ```
 where `PATH_TO_CONFIG` is the relative path of the experiment configuration file.
 
+### Flash token / coordinator experiments
+
+The 5v5 configs now expose an optional low-bandwidth “flash token” channel that mimics a centralized coach.  
+To enable it during base training, set `rollout_manager.worker.flash_token` and matching `flash_dim` fields in the algorithm `custom_config` (see `expr_configs/.../full_game/5_vs_5_hard/mappo.yaml` for reference):
+
+```yaml
+rollout_manager:
+  worker:
+    flash_token:
+      enabled: True
+      dim: 4
+      mode: gaussian_step    # or gaussian_episode / off
+      std: 1.0
+
+populations:
+  - algorithm:
+      custom_config:
+        flash_dim: 4
+        factorized_actor_use_flash: True
+        factorized_critic_use_flash: True
+```
+
+- Set `enabled: False` (or `dim: 0`) to return to the original behavior.  
+- During the second-stage “coach” experiments you can swap the random sampler with your own coordinator policy that emits the latent vector instead.
+
+The flash token is stored in the replay buffer automatically, so frozen players and downstream coordinator policies can interpret it without additional plumbing.
+
 To run experiments on a small cluster, please follow [ray](https://docs.ray.io/en/latest/ray-core/starting-ray.html)'s official instructions to start a cluster. For example, use `ray start --head` on the master, then connect other machines to the master following the hints from command line output.
 
 [Return to Contents](#contents)
@@ -294,5 +321,4 @@ TrainingTimer:
 
 ## Contact
 If you have any questions about this repo, feel free to leave an issue. You can also contact current maintainers, [YanSong97](https://github.com/YanSong97) and [DiligentPanda](https://github.com/DiligentPanda), by email.
-
 

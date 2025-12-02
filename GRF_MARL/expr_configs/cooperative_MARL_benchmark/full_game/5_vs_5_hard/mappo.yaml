@@ -90,6 +90,11 @@ rollout_manager:
     eval_rollout_length: 3001
     sample_length: 0                                     # every $sample_length traj will be push to buffer during rollout
     padding_length: # of not use in gr_football
+    flash_token:
+      enabled: True
+      dim: 4
+      mode: "gaussian_step"         # options: off, gaussian_step, gaussian_episode
+      std: 1.0
     rollout_func_name: "rollout_func"
     episode_mode: 'traj'                                    # traj or time-step
     envs:
@@ -218,6 +223,9 @@ populations:
         factorized_actor_use_global: False     # False = decentralized actor (CTDE)
         factorized_critic_use_local: False     # False = centralized critic
         factorized_critic_use_pooled: True     # True = use pooled/global state for critic
+        factorized_actor_use_flash: True
+        factorized_critic_use_flash: True
+        flash_dim: 4
         
         other_clip_param: 0.125
 

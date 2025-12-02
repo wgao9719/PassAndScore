@@ -186,6 +186,7 @@ class MAPPOLoss(LossFunc):
         (
             share_obs_batch,
             obs_batch,
+            flash_batch,
             actions_batch,
             value_preds_batch,
             return_batch,
@@ -200,6 +201,7 @@ class MAPPOLoss(LossFunc):
         ) = (
             sample[EpisodeKey.CUR_STATE],
             sample[EpisodeKey.CUR_OBS],
+            sample.get(EpisodeKey.FLASH_TOKEN, None),
             sample[EpisodeKey.ACTION].long(),
             sample[EpisodeKey.STATE_VALUE],
             sample[EpisodeKey.RETURN],
@@ -214,16 +216,19 @@ class MAPPOLoss(LossFunc):
         )
 
         if update_actor:
+            action_kwargs = {
+                EpisodeKey.CUR_STATE: share_obs_batch,
+                EpisodeKey.CUR_OBS: obs_batch,
+                EpisodeKey.ACTION: actions_batch,
+                EpisodeKey.ACTOR_RNN_STATE: actor_rnn_states_batch,
+                EpisodeKey.CRITIC_RNN_STATE: critic_rnn_states_batch,
+                EpisodeKey.DONE: dones_batch,
+                EpisodeKey.ACTION_MASK: available_actions_batch,
+            }
+            if flash_batch is not None:
+                action_kwargs[EpisodeKey.FLASH_TOKEN] = flash_batch
             ret = self._policy.compute_action(
-                **{
-                    EpisodeKey.CUR_STATE: share_obs_batch,
-                    EpisodeKey.CUR_OBS: obs_batch,
-                    EpisodeKey.ACTION: actions_batch,
-                    EpisodeKey.ACTOR_RNN_STATE: actor_rnn_states_batch,
-                    EpisodeKey.CRITIC_RNN_STATE: critic_rnn_states_batch,
-                    EpisodeKey.DONE: dones_batch,
-                    EpisodeKey.ACTION_MASK: available_actions_batch  
-                },
+                **action_kwargs,
                 inference=False,
                 explore=False
             )

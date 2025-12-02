@@ -156,6 +156,8 @@ class Actor(nn.Module):
         # Centralized: use_global=True
         self.use_global = custom_config.get("factorized_actor_use_global", False)
 
+        self.flash_dim = int(custom_config.get("flash_dim", 0))
+        self.use_flash = bool(custom_config.get("factorized_actor_use_flash", True))
         # Placeholder RNN states (not using RNN, but interface requires them)
         self.rnn_layer_num = 1
         self.rnn_state_size = 1
@@ -169,6 +171,8 @@ class Actor(nn.Module):
             base_dim = backbone.obs_dim
             
         input_dim = base_dim + (base_dim if self.use_global else 0)
+        if self.use_flash and self.flash_dim > 0:
+            input_dim += self.flash_dim
 
         self.body, last_dim = _build_mlp(
             input_dim, model_config.get("layers", []), initialization
@@ -195,6 +199,22 @@ class Actor(nn.Module):
             features = torch.cat([local, observations["global"]], dim=-1)
         else:
             features = local
+
+        if self.use_flash and self.flash_dim > 0:
+            flash = observations.get("flash_token")
+            if flash is None:
+                flash = torch.zeros(
+                    features.shape[0],
+                    self.flash_dim,
+                    dtype=features.dtype,
+                    device=features.device,
+                )
+            else:
+                flash = torch.as_tensor(
+                    flash, dtype=features.dtype, device=features.device
+                )
+                flash = flash.view(features.shape[0], self.flash_dim)
+            features = torch.cat([features, flash], dim=-1)
 
         hidden = self.body(features)
         logits = self.head(hidden)
@@ -250,6 +270,8 @@ class Critic(nn.Module):
         self.backbone = backbone
         self.num_agents = backbone.num_agents
         
+        self.flash_dim = int(custom_config.get("flash_dim", 0))
+        self.use_flash = bool(custom_config.get("factorized_critic_use_flash", False))
         # CTDE: include_local=False (centralized critic with global state)
         # DTE: include_local=True (decentralized critic)
         self.include_local = custom_config.get("factorized_critic_use_local", False)
@@ -285,6 +307,8 @@ class Critic(nn.Module):
         if input_dim == 0:
             input_dim = base_dim
             self.use_pooled = True
+        if self.use_flash and self.flash_dim > 0:
+            input_dim += self.flash_dim
 
         self.body, last_dim = _build_mlp(
             input_dim, model_config.get("layers", []), initialization
@@ -312,6 +336,22 @@ class Critic(nn.Module):
             features = torch.cat(features_list, dim=-1)
         else:
             features = features_list[0]
+
+        if self.use_flash and self.flash_dim > 0:
+            flash = observations.get("flash_token")
+            if flash is None:
+                flash = torch.zeros(
+                    features.shape[0],
+                    self.flash_dim,
+                    dtype=features.dtype,
+                    device=features.device,
+                )
+            else:
+                flash = torch.as_tensor(
+                    flash, dtype=features.dtype, device=features.device
+                )
+                flash = flash.view(features.shape[0], self.flash_dim)
+            features = torch.cat([features, flash], dim=-1)
 
         hidden = self.body(features)
         values = self.head(hidden)

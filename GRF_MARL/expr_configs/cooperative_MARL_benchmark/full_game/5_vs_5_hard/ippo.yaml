@@ -23,7 +23,7 @@ framework:
     type: "win_rate_stopper"
     kwargs:
       min_win_rate: 1.1
-      max_steps: 400          #iteration at each psro round
+      max_steps: 700          #iteration at each psro round
 agent_manager:
   num_agents: 2
   share_policies: False
@@ -90,6 +90,11 @@ rollout_manager:
     eval_rollout_length: 3001
     sample_length: 0                                     # every $sample_length traj will be push to buffer during rollout
     padding_length: # of not use in gr_football
+    flash_token:
+      enabled: False
+    #   dim: 4
+    #   mode: "gaussian_step"
+    #   std: 1.0
     rollout_func_name: "rollout_func"
     episode_mode: 'traj'                                    # traj or time-step
     envs:
@@ -217,6 +222,9 @@ populations:
         factorized_actor_use_global: False     # False = decentralized actor
         factorized_critic_use_local: True      # True = use local obs for critic
         factorized_critic_use_pooled: False    # False = no global info (pure DTE)
+        # factorized_actor_use_flash: True
+        # factorized_critic_use_flash: True
+        flash_dim: 0
         
         gamma: 0.995
         use_cuda: False  # enable cuda or not
